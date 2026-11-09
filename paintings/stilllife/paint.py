@@ -124,6 +124,9 @@ stage("second sitting"); cure_and_fix(); stage("second sitting dry")
 edges = ndimage.binary_dilation(ndimage.morphological_gradient(ids, size=3) > 0, iterations=int(s(4)) + 1)
 painter.pass_(s(6), oil(0.5), target=0.55, threshold=7.0, blur=0.5, curvature=0.7, max_len=10, phi=0.5, drag=0.35, plough=0.3, width_scale=1.4, label="features", max_strokes=int(1800 * SCALE ** 2))
 painter.pass_(s(4), oil(0.5), target=0.5, threshold=6.0, blur=0.4, curvature=0.75, max_len=8, phi=0.5, region=edges, drag=0.3, plough=0.3, width_scale=1.2, label="edges", max_strokes=int(1200 * SCALE ** 2))
+plain = np.isin(ids, [0, 1, 2]) & ~ndimage.binary_dilation(~np.isin(ids, [0, 1, 2]), iterations=int(s(5)))
+painter.pass_(s(5), oil(0.5), target=0.5, threshold=9.0, blur=0.8, curvature=0.5, max_len=6, phi=0.5, region=plain, drag=0.35, plough=0.3,
+              cell_stat="max", label="tidying", max_strokes=int(900 * SCALE ** 2))
 stage("third sitting"); cure_and_fix(); stage("third sitting dry")
 
 # ------------------------------------------------------------------ 6. glazes over dry paint, where the shadows are still too light or the colour too dull
@@ -131,7 +134,10 @@ from goo.palette import lab
 seen = painter.see(); Ls_, Lr_ = lab(seen), lab(motif)
 too_light = (Ls_[..., 0] - Lr_[..., 0] > 4) & (Lr_[..., 0] < 45)
 too_dull = (np.hypot(Lr_[..., 1], Lr_[..., 2]) - np.hypot(Ls_[..., 1], Ls_[..., 2]) > 6) & np.isin(ids, [4, 5, 6])
-glaze_region = ndimage.gaussian_filter((too_light | too_dull).astype(float), 2) > 0.5
+inside = np.zeros_like(ids, bool)
+for oid in (1, 2, 3, 4, 5, 6):                                       # glazes inside things, never along their edges
+    inside |= ndimage.binary_erosion(ids == oid, iterations=int(s(6)))
+glaze_region = (ndimage.gaussian_filter((too_light | too_dull).astype(float), 2) > 0.5) & inside
 opaque = painter.palette
 painter.palette = Palette(["ultramarine", "rose", "sienna", "green", "yellow", "red"], steps=8)   # transparent colours, no black
 painter.pass_(s(10), oil(0.1), target=0.25, threshold=3.0, blur=0.6, region=glaze_region, curvature=0.6, max_len=8, phi=0.1, drag=0.3, plough=0.1, opacity_bias=0.0, label="glazes", max_strokes=int(900 * SCALE ** 2))

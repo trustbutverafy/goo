@@ -1,4 +1,4 @@
-"""Scan the finished pear with the lidar, then look at what came back."""
+"""Scan a finished painting with the lidar (averaged spot = direct-detection intensity), then look at what came back."""
 import json, pickle, sys
 import numpy as np
 from scipy import ndimage
@@ -108,7 +108,7 @@ def panel(r, c, img, title, **kw):
     ax = fig.add_subplot(gs[r, c]); ax.imshow(img, **kw); ax.set_title(title, color="#ddd", fontsize=11, loc="left"); ax.axis("off"); return ax
 panel(0, 0, photo, "1  the painting (diffuse light)")
 panel(0, 1, rake, "2  raking light from the left: the brushwork")
-ax = panel(0, 2, np.where(holes, np.nan, ig), "3  lidar intensity at 1550 nm: underdrawing + pentimento", cmap="gray",
+ax = panel(0, 2, np.where(holes, np.nan, ig), os.environ.get("IRTITLE", "3  lidar intensity at 1550 nm: underdrawing + pentimento"), cmap="gray",
            vmin=np.nanpercentile(ig, 1), vmax=np.nanpercentile(ig, 99.5))
 hs = raking(zf, np.ones((H, W, 3)) * 0.85)[..., 0]
 panel(1, 0, hs, "4  lidar height, hillshaded (merged stations)", cmap="gray")
@@ -117,13 +117,13 @@ ax = panel(1, 1, (zf - ndimage.gaussian_filter(zf, 18)) * 1000, "5  lidar height
 blind = ~cov_g; blind_img = np.repeat((0.25 + 0.6 * (hs - hs.min()) / (np.ptp(hs) + 1e-9))[..., None], 3, 2)
 blind_img[blind] = [0.95, 0.25, 0.2]
 panel(1, 2, blind_img, f"6  grazing scan (78 deg, from left): no return in red ({stats['shadowed_grazing_78deg']:.1%}: shadows + dropouts)")
-panel(2, 0, peel[0], "7  stratum 1: the charcoal (and the first pear)")
+panel(2, 0, peel[0], "7  stratum 1: the charcoal underdrawing")
 panel(2, 1, peel[1], "8  + stratum 2: the imprimatura")
 ax = fig.add_subplot(gs[2, 2]); ax.imshow(cloud_rgb); ax.set_title("9  point cloud, oblique, z x6", color="#ddd", fontsize=11, loc="left"); ax.axis("off")
 # cross-sections through the brightest impasto and through the signature
 ax = fig.add_subplot(gs[3, 0:2]); ax.set_facecolor("#181818")
 row = int(np.argmax(cv.h.max(1)))
-rows = {"impasto row": row, "signature row": 220}
+rows = {"impasto row": row, "signature row": int(os.environ.get("SIGROW", 220))}
 for (lab, r), c in zip(rows.items(), ["#f3c26b", "#8ecae6"]):
     x = (np.arange(W) + 0.5) * CELL
     base = cv.g[r] * CELL; ax.fill_between(x, -0.05, base, color="#555", lw=0)

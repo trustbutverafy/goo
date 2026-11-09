@@ -2,13 +2,14 @@
 import base64, json
 import numpy as np
 
-OUT = "out"
-with open(f"{OUT}/pear-scan.ply", "rb") as f:
+import os
+OUT = os.environ.get("OUT", "out"); NAME = os.environ.get("NAME", "pear")
+with open(f"{OUT}/{NAME}-scan.ply", "rb") as f:
     data = f.read()
 i = data.index(b"end_header\n") + len(b"end_header\n")
 rec = np.frombuffer(data[i:], dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("i", "<f4"), ("r", "u1"), ("g", "u1"), ("b", "u1")])
 rng = np.random.default_rng(1)
-N = min(len(rec), 420000)
+N = min(len(rec), int(os.environ.get("NPTS", 420000)))
 rec = rec[rng.choice(len(rec), N, replace=False)]
 x, y, z = rec["x"], rec["y"], rec["z"]
 lo = np.array([x.min(), y.min(), z.min()]); hi = np.array([x.max(), y.max(), z.max()])
@@ -16,13 +17,13 @@ q = lambda v, a, b: np.round((v - a) / (b - a) * 65535).astype("<u2")
 xyz = np.stack([q(x, lo[0], hi[0]), q(y, lo[1], hi[1]), q(z, lo[2], hi[2])], 1).ravel()
 inten = np.clip(rec["i"] / np.percentile(rec["i"], 99.5), 0, 1)
 attr = np.stack([rec["r"], rec["g"], rec["b"], (inten * 255).astype("u1")], 1).ravel().astype("u1")
-stats = json.load(open(f"{OUT}/pear-scan-stats.json"))
+stats = json.load(open(f"{OUT}/{NAME}-scan-stats.json"))
 meta = dict(n=N, lo=lo.tolist(), hi=hi.tolist(), stats=stats)
 B = base64.b64encode(xyz.tobytes()).decode(); A = base64.b64encode(attr.tobytes()).decode()
 
 html = r"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Pear, scanned: 1550 nm lidar of a simulated oil painting</title>
+<title>__TITLE__</title>
 <style>
 :root{--bg:#0f0f10;--ink:#e8e4dc;--dim:#9a958c;--acc:#e3b062}
 html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -44,8 +45,8 @@ input[type=range]{flex:1}
 </style></head><body>
 <canvas id="c"></canvas>
 <div class="panel">
- <h1>Pear on a ledge, scanned</h1>
- <p>A simulated oil painting on gesso (80 &times; 60 mm), scanned by a simulated 1550&nbsp;nm FMCW lidar from two stations. At 1550&nbsp;nm the paint turns translucent: the <b>intensity</b> view shows the charcoal underdrawing, including a first pear the painter abandoned.</p>
+ <h1>__TITLE__</h1>
+ <p>__BLURB__</p>
  <div class="row" id="modes">
   <button data-m="0" class="on">camera colour</button><button data-m="1">1550 nm intensity</button><button data-m="2">height</button>
  </div>
@@ -80,7 +81,8 @@ function buf(d,loc,n,type,norm){const b=gl.createBuffer();gl.bindBuffer(gl.ARRAY
 buf(P,'p',3,gl.UNSIGNED_SHORT,false);buf(A,'a',4,gl.UNSIGNED_BYTE,true);
 const U=n=>gl.getUniformLocation(pr,n);
 gl.uniform3fv(U('lo'),META.lo);gl.uniform3fv(U('hi'),META.hi);
-let mode=0,ex=8,ps=2,yaw=-0.5,pitch=0.75,dist=95,tx=0,ty=0,spin=false;
+const D0=1.15*Math.max(META.hi[0]-META.lo[0],META.hi[1]-META.lo[1]);
+let mode=0,ex=8,ps=2,yaw=-0.5,pitch=0.75,dist=D0,tx=0,ty=0,spin=false;
 const cx=(META.lo[0]+META.hi[0])/2, cy=(META.lo[1]+META.hi[1])/2;
 function mat(){const w=cv.width,h=cv.height,f=1/Math.tan(0.35),asp=w/h,n=1,fa=1000;
  const Pm=[f/asp,0,0,0, 0,f,0,0, 0,0,(fa+n)/(n-fa),-1, 0,0,2*fa*n/(n-fa),0];
@@ -100,21 +102,22 @@ function loop(){if(spin)yaw+=0.004;draw();requestAnimationFrame(loop)}loop();
 document.querySelectorAll('#modes button').forEach(b=>b.onclick=()=>{mode=+b.dataset.m;document.querySelectorAll('#modes button').forEach(x=>x.classList.toggle('on',x===b))});
 document.getElementById('ex').oninput=e=>{ex=+e.target.value;document.getElementById('ev').textContent=ex};
 document.getElementById('ps').oninput=e=>{ps=+e.target.value};
-document.getElementById('top').onclick=()=>{yaw=0;pitch=0.001;dist=95;tx=ty=0};
-document.getElementById('rake').onclick=()=>{yaw=-0.2;pitch=1.25;dist=70};
+document.getElementById('top').onclick=()=>{yaw=0;pitch=0.001;dist=D0;tx=ty=0};
+document.getElementById('rake').onclick=()=>{yaw=-0.2;pitch=1.25;dist=0.75*D0};
 const sb=document.getElementById('spin');sb.onclick=()=>{spin=!spin;sb.classList.toggle('on',spin)};
 let ptrs=new Map(),last=null,pinch=null;
 cv.addEventListener('pointerdown',e=>{cv.setPointerCapture(e.pointerId);ptrs.set(e.pointerId,[e.clientX,e.clientY]);last=[e.clientX,e.clientY,e.shiftKey]});
 cv.addEventListener('pointermove',e=>{if(!ptrs.has(e.pointerId))return;ptrs.set(e.pointerId,[e.clientX,e.clientY]);
- if(ptrs.size===2){const [a,b]=[...ptrs.values()];const d=Math.hypot(a[0]-b[0],a[1]-b[1]);if(pinch)dist=Math.max(15,Math.min(400,dist*pinch/d));pinch=d;return}
+ if(ptrs.size===2){const [a,b]=[...ptrs.values()];const d=Math.hypot(a[0]-b[0],a[1]-b[1]);if(pinch)dist=Math.max(0.15*D0,Math.min(4*D0,dist*pinch/d));pinch=d;return}
  if(!last)return;const dx=e.clientX-last[0],dy=e.clientY-last[1];
  if(e.shiftKey){const s=dist/innerHeight;tx-=(dx*Math.cos(yaw)+dy*Math.sin(yaw))*s;ty-=(-dx*Math.sin(yaw)+dy*Math.cos(yaw))*s*-1}
  else{yaw+=dx*0.006;pitch=Math.max(0.001,Math.min(1.5,pitch+dy*0.005))}
  last=[e.clientX,e.clientY]});
 const up=e=>{ptrs.delete(e.pointerId);if(ptrs.size<2)pinch=null;if(!ptrs.size)last=null};
 cv.addEventListener('pointerup',up);cv.addEventListener('pointercancel',up);
-cv.addEventListener('wheel',e=>{e.preventDefault();dist=Math.max(15,Math.min(400,dist*Math.exp(e.deltaY*0.001)))},{passive:false});
+cv.addEventListener('wheel',e=>{e.preventDefault();dist=Math.max(0.15*D0,Math.min(4*D0,dist*Math.exp(e.deltaY*0.001)))},{passive:false});
 </script></body></html>"""
+html = html.replace("__TITLE__", os.environ.get("TITLE", "Scan")).replace("__BLURB__", os.environ.get("BLURB", ""))
 html = html.replace("__META__", json.dumps(meta)).replace("__XYZ__", B).replace("__ATTR__", A)
-open(f"{OUT}/pear-scan-viewer.html", "w").write(html)
+open(f"{OUT}/{NAME}-scan-viewer.html", "w").write(html)
 print(f"{N} points, {len(html) / 1e6:.1f} MB")

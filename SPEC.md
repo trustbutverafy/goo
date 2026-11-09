@@ -10,7 +10,8 @@ This is the contract between goo's parts. Code that breaks it is wrong even if t
 | **Tools** | `goo.brush.Brush`, `Stylus` | their own load and footprint; the wet layer they touch | the tool fields `U`, `V` (velocities) and the wet layer, only by exchange with their load |
 | **Optics** | `Canvas.reflectance()` | species volumes per layer | nothing (pure function) |
 | **Sensors** | `goo.sensors.*` | a `Surface`: height (mm), reflectance per band, roughness (µm), gloss | nothing in the World |
-| **Painters, studies** | `paintings/`, `studies/` | whatever they are given | the World only through Tools, `Canvas.add`, `fix`, `wait`, `step` |
+| **Painter** | `goo.painter`, `goo.palette` | colour seen on the canvas (`reflectance`), its motif, its paints | the World only through Tools, `fix`, `wait`, `step` |
+| **Paintings, studies** | `paintings/`, `studies/` | whatever they are given | the World only through Tools, `Canvas.add`, `fix`, `wait`, `step` |
 
 Two rules carry most of the weight:
 
@@ -36,6 +37,7 @@ Realistic quantities, for calibration: a paint layer is 0.1–0.4 units (25–10
 - **I3 Exact zero.** Every law has a switch in `Canvas.L` (`flow, drag, diffusion, evaporation, absorption, curing`). With all of them 0 and no tool touching, `step()` leaves `q` bit-for-bit unchanged.
 - **I4 Determinism.** The same session (same seeds, same calls) gives the same arrays.
 - **I5 Strata are immutable.** Only `fix()` creates a stratum; nothing modifies one afterwards. Tools act on the wet layer only.
+- **I7 Two clocks.** Tools act every tick, in a window around the touch; the slow laws (§4.2, 4.4–4.6) run over the elapsed ticks every `L["lazy"]` ticks (`flush()`); `fix`, `wait` flush first. `lazy = 1` runs every law every tick. `flow_sub`, `diff_sub` cap substeps per tick for leveling and colour diffusion; both are stable at any cap (face caps, §4.2, 4.4), so the caps trade the speed of very fast leveling for time, never stability or conservation.
 - **I6 Stability without loss.** `step()` chooses its own substeps from every process's stability limit; `capped` counts steps that hit `max_sub` and should stay 0 in normal use. A step may be slow; it may not blow up, go negative, or lose paint.
 
 ## 4. The World's laws
@@ -55,7 +57,7 @@ Derived: thickness `h = Σ_s q_s`, solid fraction `φ = Σ_pigments q / h`.
 
 ## 5. Tools
 
-A `Brush` has a width, bristles (an uneven, per-brush clumping profile), a load (volumes per species), `exchange`, `drag`, `plough`. `touch()`:
+A `Brush`'s `exchange` is per pass: the fraction of the way to the target a cell gets as the whole (swept) footprint passes over it, spread over the touches that takes, so the paint laid doesn't depend on the brush's speed. A `Brush` has a width, bristles (an uneven, per-brush clumping profile), a load (volumes per species), `exchange`, `drag`, `plough`. `touch()`:
 
 - writes `U` and `V` where it touches;
 - exchanges paint with the wet layer toward `target·pressure·(0.55 + 0.45·bristle)`, at a rate set by contact `w`: gives from its load (in the load's proportions, at most a quarter of the load per touch), picks up the excess (in the canvas's proportions). Every unit given leaves the load; every unit taken enters it.

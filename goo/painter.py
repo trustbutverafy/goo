@@ -81,7 +81,7 @@ class Painter:
 
     def pass_(self, R, paint, target, threshold=6.0, curvature=0.6, min_len=2, max_len=14, blur=1.0,
               region=None, colour_tol=14.0, label="", width_scale=1.8, pressure=1.0, load_factor=1.6,
-              max_strokes=None, bristles=None, transparent=False, phi=0.5, speed=0.5, drag=1.0, plough=0.5, exchange=0.85, opacity_bias=12.0):
+              max_strokes=None, bristles=None, transparent=False, phi=0.5, speed=0.5, drag=1.0, plough=0.5, exchange=0.85, opacity_bias=6.0, cell_stat="mean"):
         """One layer of strokes with brush radius R (cells). `paint(mix) -> load` builds the brush load from a
         mix; `target` is the thickness the brush lays. Returns the number of strokes."""
         cv, H, W = self.cv, self.cv.H, self.cv.W
@@ -100,8 +100,9 @@ class Painter:
         for y0 in range(0, H, g):
             for x0 in range(0, W, g):
                 cell = diff[y0:y0 + g, x0:x0 + g]
-                if cell.mean() > threshold:
-                    k = np.argmax(cell); starts.append((cell.mean(), y0 + k // cell.shape[1], x0 + k % cell.shape[1]))
+                v = cell.max() if cell_stat == "max" else cell.mean()           # 'max': a painter's eye for a stray mark
+                if v > threshold:
+                    k = np.argmax(cell); starts.append((v, y0 + k // cell.shape[1], x0 + k % cell.shape[1]))
         if threshold <= 0:                                                  # a first pass covers the panel to its edges
             for v in range(g // 2, H, g): starts += [(99.0, v, 1), (99.0, v, W - 2)]
             for u in range(g // 2, W, g): starts += [(99.0, 1, u), (99.0, H - 2, u)]

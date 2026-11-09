@@ -50,10 +50,13 @@ class Brush:
         cv = self.cv
         sp = np.hypot(dx, dy); tx, ty = (dx / sp, dy / sp) if sp > 1e-9 else (1.0, 0.0)
         r = self.width / 2 * (0.6 + 0.4 * pressure)
-        x0, x1 = int(max(0, x - r - 2)), int(min(cv.W, x + r + 3)); y0, y1 = int(max(0, y - r - 2)), int(min(cv.H, y + r + 3))
+        # the footprint is swept: the capsule from where the brush was (x - dx, y - dy) to where it is
+        xs_, ys_ = (x - dx, x), (y - dy, y)
+        x0, x1 = int(max(0, min(xs_) - r - 2)), int(min(cv.W, max(xs_) + r + 3)); y0, y1 = int(max(0, min(ys_) - r - 2)), int(min(cv.H, max(ys_) + r + 3))
         if x0 >= x1 or y0 >= y1: return
         yy, xx = np.mgrid[y0:y1, x0:x1] + 0.5
         along = (xx - x) * tx + (yy - y) * ty; across = -(xx - x) * ty + (yy - y) * tx
+        along = along - np.clip(along, -sp, 0.0)                    # inside the swept segment: no along-distance
         foot = np.clip(1.6 - np.hypot(along / (0.55 * r + 0.8), across / r) * 1.6, 0, 1)   # soft-edged oval
         if not foot.any(): return
         nb = self.bristles
@@ -96,7 +99,7 @@ class Brush:
         # exchange is per pass of the brush over a cell, not per tick: a cell under the footprint is touched about
         # (footprint length / speed) times, so each touch takes its share of the pass's exchange
         foot = 2 * (0.55 * self.width / 2 + 0.8)
-        k = max(1.0, foot / max(speed, 1e-6))
+        k = max(1.0, (foot + speed) / max(speed, 1e-6))            # touches per cell under a swept footprint
         self._ex_touch = 1 - (1 - min(self.exchange, 0.999)) ** (1 / k)
         seg = [(a, b) for a, b in zip(pts, pts[1:])]
         for (xa, ya, pa), (xb, yb, pb) in seg:
