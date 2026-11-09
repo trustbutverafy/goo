@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "goo"
+version = "0.1.0"
+description = "A physical paint medium (water, oil, pigment suspensions), the tools that move it, and the sensors that scan the result."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "scipy>=1.10", "scikit-image>=0.21", "matplotlib>=3.7", "pillow>=10"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools]
+packages = ["goo", "goo.sensors"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
