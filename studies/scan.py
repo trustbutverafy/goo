@@ -9,8 +9,10 @@ from PIL import Image
 from goo.engine import Canvas
 from goo.sensors.lidar import Scanner, grid, write_ply, CELL, bilinear
 
-OUT = "out"
-cv = pickle.load(open(f"{OUT}/pear.canvas.pkl", "rb"))
+import os
+CANVAS = os.environ.get("CANVAS", "out/pear.canvas.pkl")
+OUT = os.environ.get("OUT", "out"); NAME = os.environ.get("NAME", "pear")
+cv = pickle.load(open(CANVAS, "rb"))
 H, W = cv.H, cv.W; Wm, Hm = W * CELL, H * CELL
 
 # ---- what the World presents to a sensor: a surface and its optics (never the species)
@@ -34,7 +36,7 @@ xyz = np.concatenate([s["xyz"] for s in stations.values()]); I = np.concatenate(
 col = np.concatenate([s["rgb"] for s in stations.values()]); cos = np.concatenate([s["cos"] for s in stations.values()])
 # PLY in a right-handed frame (x right, y up the panel, z out of it)
 P = xyz.copy(); P[:, 1] = Hm - P[:, 1]
-write_ply(f"{OUT}/pear-scan.ply", P, I, col)
+write_ply(f"{OUT}/{NAME}-scan.ply", P, I, col)
 
 # ---- back onto a grid: height, coverage per station, intensity normalised for incidence
 zg, cnt = grid(xyz, xyz[:, 2], (H, W))
@@ -68,7 +70,7 @@ def raking(Zmm, albedo, light=(-0.85, -0.35, 0.40), gl=None):
 srgb = lambda a: np.clip(a, 0, 1) ** (1 / 2.2)
 photo = srgb(rgb)
 rake = srgb(raking(Z, rgb, gl=gloss))
-plt.imsave(f"{OUT}/pear-photo.png", photo); plt.imsave(f"{OUT}/pear-raking.png", rake)
+plt.imsave(f"{OUT}/{NAME}-photo.png", photo); plt.imsave(f"{OUT}/{NAME}-raking.png", rake)
 
 # peel the layers back (the painting's own stratigraphy, as the World holds it, for comparison)
 peel = [srgb(cv.reflectance(layers=k)[..., :3]) for k in (1, 2, 3)]
@@ -97,7 +99,7 @@ Pv = xyz[sel].copy(); Pv[:, 1] = Hm - Pv[:, 1]
 shade = np.clip(I[sel] / np.percentile(I, 99), 0, 1)
 cloud_rgb = oblique(Pv, srgb(col[sel]) * (0.55 + 0.45 * shade[:, None]))
 cloud_nir = oblique(Pv, np.repeat(shade[:, None], 3, 1))
-plt.imsave(f"{OUT}/pear-cloud-rgb.png", cloud_rgb); plt.imsave(f"{OUT}/pear-cloud-nir.png", cloud_nir)
+plt.imsave(f"{OUT}/{NAME}-cloud-rgb.png", cloud_rgb); plt.imsave(f"{OUT}/{NAME}-cloud-nir.png", cloud_nir)
 
 # ---- the contact sheet
 fig = plt.figure(figsize=(16, 21.5), facecolor="#111")
@@ -145,6 +147,6 @@ txt = (f"lidar  1550 nm FMCW, 2 stations at 150 mm, 40 deg\n"
        f"thickest paint     {stats['paint_max_mm']:.2f} mm\n"
        f"relief range       {stats['relief_range_mm']:.2f} mm")
 ax.text(0, 0.95, txt, color="#ddd", family="monospace", fontsize=10.5, va="top")
-fig.savefig(f"{OUT}/pear-contact-sheet.png", dpi=110, facecolor="#111", bbox_inches="tight")
-json.dump(stats, open(f"{OUT}/pear-scan-stats.json", "w"), indent=1)
+fig.savefig(f"{OUT}/{NAME}-contact-sheet.png", dpi=110, facecolor="#111", bbox_inches="tight")
+json.dump(stats, open(f"{OUT}/{NAME}-scan-stats.json", "w"), indent=1)
 print("saved")

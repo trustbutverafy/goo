@@ -31,8 +31,10 @@ def down(a, order=1):
 motif, ids, hl = down(ref["rgb"]), down(ref["ids"], 0), down(ref["highlight"])
 H, W = ids.shape
 PAL = ["white", "carbon", "ultramarine", "yellow", "red", "rose", "ochre", "sienna", "green"]
-cv = Canvas(W, H, PAL, seed=11, laws=dict(lazy=30, cure_rate=0.0))
-painter = Painter(cv, motif, ids, Palette(PAL, steps=12), seed=5)
+cv = Canvas(W, H, PAL, seed=11, laws=dict(lazy=90, cure_rate=0.0, flow_sub=0.1, diff_sub=0.1))  # leveling capped at 1 substep per 4 ticks: very runny paint levels over
+                                                                     # tens of ticks, not a fraction of one (stable either way: the face cap)
+PLAN = {0: np.radians(62), 1: 0.0, 2: 0.0, 3: "around", 4: "around", 5: "around", 6: "around", 7: np.radians(-20), 8: np.radians(-20)}
+painter = Painter(cv, motif, ids, Palette(PAL, steps=12), seed=5, plan=PLAN)
 rng = np.random.default_rng(3)
 s = lambda v: v * SCALE                                          # lengths in full-size cells
 frames, log = [], []
@@ -56,6 +58,14 @@ def stage(name):
     print(f"[{time.time() - T0:6.0f}s] {name:34s} t={cv.t:6d} strata={len(cv.strata)} residual={worst:.0e} max_h={cv.h.max():.2f} "
           f"dE={e:5.1f} (at 1 mm: {e4:5.1f})", flush=True)
     snap(force=True)
+    import matplotlib.pyplot as plt
+    plt.imsave(f"{OUT}/stage-{len(log):02d}.png", frames[-1][1])
+
+_pass = painter.pass_
+def pass_(*a, **k):
+    t0 = time.time(); n = _pass(*a, **k)
+    print(f"         {k.get('label', ''):28s} {n:5d} strokes in {time.time() - t0:5.0f}s, swatch {painter.log[-1]['swatch']:.3f}", flush=True); return n
+painter.pass_ = pass_
 
 def cure_and_fix(ticks=400):
     cv.L["cure_rate"] = 0.002; cv.wait(int(ticks), cure_boost=12.0); cv.L["cure_rate"] = 0.0
@@ -89,42 +99,44 @@ draw([(2, by), (W - 2, by)], target=0.035)
 stage("charcoal"); cv.fix(); stage("fixative")
 
 # ------------------------------------------------------------------ 2. imprimatura
-wash = lambda: Brush.paint("water", 0.06, 12000 * SCALE ** 2 * 4, {"sienna": 3, "ochre": 1})
+wash = lambda: Brush.paint("water", 0.09, 12000 * SCALE ** 2 * 4, {"sienna": 3, "ochre": 1})
 mop = Brush(cv, s(60), bristles=14, exchange=0.45, plough=0.2, load=wash())
-for row, y in enumerate(np.arange(s(20), H, s(40))):
+for row, y in enumerate(np.arange(s(8), H + s(20), s(36))):
     xs = (-6, W + 6) if row % 2 == 0 else (W + 6, -6)
     mop.charge(wash())
-    mop.stroke([(xs[0], y + rng.normal(0, 2)), ((xs[0] + xs[1]) / 2, y + rng.normal(0, 3)), (xs[1], y + rng.normal(0, 2))], speed=s(6), pressure=0.9, target=0.5)
+    mop.stroke([(xs[0], y + rng.normal(0, 2)), ((xs[0] + xs[1]) / 2, y + rng.normal(0, 3)), (xs[1], y + rng.normal(0, 2))], speed=s(12), pressure=0.9, target=0.3)
 stage("imprimatura laid")
 cv.wait(300, evap_boost=8.0)
 while cv.q[0].max() > 1e-6: cv.wait(60, evap_boost=8.0)
 cv.fix(); stage("imprimatura sealed")
 
 # ------------------------------------------------------------------ 3. dead colour
-painter.pass_(s(28), oil(0.42), target=0.26, threshold=5.0, blur=1.0, curvature=0.5, max_len=10, colour_tol=18, phi=0.42, label="dead colour")
-painter.pass_(s(20), oil(0.42), target=0.24, threshold=7.0, blur=0.8, curvature=0.5, max_len=10, colour_tol=16, phi=0.42, label="dead colour 2")
+painter.pass_(s(28), oil(0.42), target=0.4, threshold=0.0, blur=1.0, curvature=0.5, max_len=6, colour_tol=18, phi=0.42, label="dead colour")
+painter.pass_(s(20), oil(0.42), target=0.4, threshold=8.0, blur=0.8, curvature=0.5, max_len=7, colour_tol=16, phi=0.42, label="dead colour 2")
 stage("dead colour"); left = cure_and_fix(); stage(f"dead colour dry")
 
 # ------------------------------------------------------------------ 4. second sitting
-painter.pass_(s(14), oil(0.48), target=0.3, threshold=5.0, blur=0.7, curvature=0.6, max_len=12, phi=0.48, label="second sitting")
-painter.pass_(s(9), oil(0.48), target=0.3, threshold=6.0, blur=0.6, curvature=0.7, max_len=12, phi=0.48, label="second sitting, smaller")
+painter.pass_(s(14), oil(0.48), target=0.5, threshold=5.0, blur=0.7, curvature=0.6, max_len=9, phi=0.48, drag=0.7, label="second sitting")
+painter.pass_(s(9), oil(0.48), target=0.5, threshold=6.0, blur=0.6, curvature=0.7, max_len=12, phi=0.48, drag=0.6, label="second sitting, smaller", max_strokes=int(1500 * SCALE ** 2))
 stage("second sitting"); cure_and_fix(); stage("second sitting dry")
 
-# ------------------------------------------------------------------ 5. glazes, where the shadows are still too light
-from goo.palette import lab
-seen = painter.see(); Ls, Lr = lab(seen)[..., 0], lab(motif)[..., 0]
-too_light = ndimage.gaussian_filter(((Ls - Lr) > 4) & (Lr < 45), 2) > 0.5
-glaze_pal = painter.palette
-painter.palette = Palette(["ultramarine", "rose", "sienna", "green", "carbon", "yellow"], steps=8)
-painter.pass_(s(12), oil(0.08), target=0.14, threshold=3.0, blur=0.8, region=too_light, curvature=0.6, max_len=10, phi=0.08, label="glazes")
-painter.palette = glaze_pal
-stage("glazes")
-
-# ------------------------------------------------------------------ 6. third sitting: edges and features, wet into wet
+# ------------------------------------------------------------------ 5. third sitting: features and edges, a loaded brush and a light touch
 edges = ndimage.binary_dilation(ndimage.morphological_gradient(ids, size=3) > 0, iterations=int(s(4)) + 1)
-painter.pass_(s(6), oil(0.5), target=0.3, threshold=6.0, blur=0.5, curvature=0.7, max_len=10, phi=0.5, label="features")
-painter.pass_(s(4), oil(0.5), target=0.28, threshold=7.0, blur=0.4, curvature=0.75, max_len=8, phi=0.5, region=edges, label="edges")
-stage("third sitting")
+painter.pass_(s(6), oil(0.5), target=0.55, threshold=7.0, blur=0.5, curvature=0.7, max_len=10, phi=0.5, drag=0.35, plough=0.3, width_scale=1.4, label="features", max_strokes=int(1800 * SCALE ** 2))
+painter.pass_(s(4), oil(0.5), target=0.5, threshold=6.0, blur=0.4, curvature=0.75, max_len=8, phi=0.5, region=edges, drag=0.3, plough=0.3, width_scale=1.2, label="edges", max_strokes=int(1200 * SCALE ** 2))
+stage("third sitting"); cure_and_fix(); stage("third sitting dry")
+
+# ------------------------------------------------------------------ 6. glazes over dry paint, where the shadows are still too light or the colour too dull
+from goo.palette import lab
+seen = painter.see(); Ls_, Lr_ = lab(seen), lab(motif)
+too_light = (Ls_[..., 0] - Lr_[..., 0] > 4) & (Lr_[..., 0] < 45)
+too_dull = (np.hypot(Lr_[..., 1], Lr_[..., 2]) - np.hypot(Ls_[..., 1], Ls_[..., 2]) > 6) & np.isin(ids, [4, 5, 6])
+glaze_region = ndimage.gaussian_filter((too_light | too_dull).astype(float), 2) > 0.5
+opaque = painter.palette
+painter.palette = Palette(["ultramarine", "rose", "sienna", "green", "yellow", "red"], steps=8)   # transparent colours, no black
+painter.pass_(s(10), oil(0.1), target=0.25, threshold=3.0, blur=0.6, region=glaze_region, curvature=0.6, max_len=8, phi=0.1, drag=0.3, plough=0.1, opacity_bias=0.0, label="glazes", max_strokes=int(900 * SCALE ** 2))
+painter.palette = opaque
+stage("glazes"); cure_and_fix(); stage("glazes dry")
 
 # ------------------------------------------------------------------ 7. impasto on the highlights
 lbl, n = ndimage.label(hl > 0.22)

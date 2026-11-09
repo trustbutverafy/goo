@@ -14,7 +14,7 @@ import numpy as np
 
 
 class Brush:
-    def __init__(self, cv, width, bristles=None, load=None, exchange=0.35, tooth_only=False, drag=1.0, plough=0.5):
+    def __init__(self, cv, width, bristles=None, load=None, exchange=0.6, tooth_only=False, drag=1.0, plough=0.5):
         self.cv, self.width, self.exchange, self.tooth_only, self.drag, self.plough = cv, width, exchange, tooth_only, drag, plough
         self.bristles = bristles if bristles is not None else max(1, int(width / 2.5))
         self.load = np.zeros(len(cv.species))
@@ -74,7 +74,10 @@ class Brush:
         q = cv.q[:, y0:y1, x0:x1]; h = q.sum(0)
         # contact pressure sets how fast paint is exchanged, not how thick it ends up: the rim of the footprint
         # moves toward the same target as the middle, only more slowly
-        want = self.exchange * w * (w > 0.05) * (target * pressure * (0.55 + 0.45 * bris) - h)   # each bristle lays its own ribbon
+        ex = getattr(self, "_ex_touch", self.exchange)       # per-touch rate (stroke() derives it from the per-pass rate)
+        contact = np.clip(2.0 * foot, 0, 1) * (w > 0.05)       # pressed paint is in full contact; the soft rim less
+        if self.tooth_only: contact = contact * np.clip(w / np.maximum(foot * bris, 1e-9), 0, 1)
+        want = ex * contact * (target * pressure * (0.55 + 0.45 * bris) - h)   # each bristle lays its own ribbon
         give = np.clip(want, 0, None); take = np.clip(-want, 0, None) * 0.25
         L = self.load.sum()
         if L > 1e-12 and give.sum() > 0:
@@ -90,6 +93,11 @@ class Brush:
     def stroke(self, path, speed=2.5, pressure=1.0, target=0.6, steps_after=0):
         """path: [(x, y) or (x, y, pressure)]; the brush moves `speed` cells per step; the canvas steps as it goes."""
         pts = [(p[0], p[1], p[2] if len(p) > 2 else pressure) for p in path]
+        # exchange is per pass of the brush over a cell, not per tick: a cell under the footprint is touched about
+        # (footprint length / speed) times, so each touch takes its share of the pass's exchange
+        foot = 2 * (0.55 * self.width / 2 + 0.8)
+        k = max(1.0, foot / max(speed, 1e-6))
+        self._ex_touch = 1 - (1 - min(self.exchange, 0.999)) ** (1 / k)
         seg = [(a, b) for a, b in zip(pts, pts[1:])]
         for (xa, ya, pa), (xb, yb, pb) in seg:
             L = np.hypot(xb - xa, yb - ya); n = max(1, int(np.ceil(L / speed)))
@@ -99,6 +107,7 @@ class Brush:
                 self.touch(x, y, (xb - xa) / n, (yb - ya) / n, pa + (pb - pa) * t1, target)
                 self.cv.step()
         for _ in range(steps_after): self.cv.step()
+        del self._ex_touch
 
 
 class Stylus(Brush):

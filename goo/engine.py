@@ -86,7 +86,7 @@ class Canvas:
         self.L = dict(G=1.0, eta0=0.12, phi_m=0.64, phi_y=0.2, tau0=0.05, tau_cure=1.0, D0=0.15, evap=0.0006, edge_evap=0.006,
                       absorb=0.004 if ground == "gesso" else 0.04, store_cap=0.08, store_evap=0.002,
                       cure_rate=0.0, cure_stiff=400.0, cure_yield=300.0, drag_range=1.4,
-                      flow=1.0, drag=1.0, diffusion=1.0, evaporation=1.0, absorption=1.0, curing=1.0, max_sub=600, flow_sub=48, h_pin=0.08, lazy=1)
+                      flow=1.0, drag=1.0, diffusion=1.0, evaporation=1.0, absorption=1.0, curing=1.0, max_sub=600, flow_sub=48, h_pin=0.08, lazy=1, diff_sub=1e9)
         if laws: self.L.update(laws)
         self.U = np.zeros((2, H, W))                        # tool velocity imposed this step (cells / step)
         self.V = np.zeros((2, H, W))                        # plough: paint squeezed out from under a tool
@@ -134,7 +134,7 @@ class Canvas:
             a = np.pad(self.U[c, y0:y1, x0:x1], pad)
             out.append(np.fft.irfft2(np.fft.rfft2(a) * filt, s=(Hh, Ww))[pad:-pad, pad:-pad])
         u = (np.stack(out) + self.V[:, y0:y1, x0:x1]) * self.L["drag"]
-        return u * (self.h[y0:y1, x0:x1] > 1e-9), (y0, y1, x0, x1)   # only paint is carried
+        return u * (self.q[:, y0:y1, x0:x1].sum(0) > 1e-9), (y0, y1, x0, x1)   # only paint is carried
 
     # ---- time. Two clocks: tools act every tick, locally; the slow laws (leveling, colour, drying, curing)
     #      catch up every L["lazy"] ticks with the whole elapsed time, at their own stability limits.
@@ -175,7 +175,8 @@ class Canvas:
         mob = (Y * Y * (3 * h - Y) / (6 * eta)).max() * L["flow"]
         D = (L["D0"] * L["eta0"] / eta).max() * L["diffusion"]
         n_flow = min(4.4 * L["G"] * mob / 0.8, L["flow_sub"]) * dt  # beyond flow_sub the face cap keeps it stable
-        n = int(np.ceil(max(1.0, n_flow, 4 * D * dt / 0.8)))
+        n_diff = min(4 * D / 0.8, L["diff_sub"]) * dt              # likewise for colour diffusion (face cap)
+        n = int(np.ceil(max(1.0, n_flow, n_diff)))
         if n > L["max_sub"] * dt: self.capped += 1; n = int(L["max_sub"] * dt)
         for _ in range(n): self._sub(dt / n)
         self.substeps += n; self.pending = 0
@@ -209,7 +210,8 @@ class Canvas:
             for axis, F in ((1, Fx), (0, Fy)):
                 a = (slice(None), slice(None, -1)) if axis == 1 else (slice(None, -1), slice(None))
                 b = (slice(None), slice(1, None)) if axis == 1 else (slice(1, None), slice(None))
-                Df = np.minimum(Dc[a], Dc[b]) * (wet[a] & wet[b]) * np.minimum(st[a], st[b])
+                # each face exchanges at most a fifth of the composition difference (max principle): stable at any dt
+                Df = np.minimum(np.minimum(Dc[a], Dc[b]), 0.2) * (wet[a] & wet[b]) * np.minimum(st[a], st[b])
                 F[self.nc:] += Df * (x[(slice(None),) + a] - x[(slice(None),) + b])
         Fx, Fy = limit(Fx, Fy, q)
         q[..., :, :-1] -= Fx; q[..., :, 1:] += Fx; q[..., :-1, :] -= Fy; q[..., 1:, :] += Fy

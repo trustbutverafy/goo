@@ -50,11 +50,16 @@ class Palette:
 
     def match(self, target_linear, under_linear, solids, oil=0.0, opacity_bias=0.0):
         """Best mix for `target` (linear RGB) laid at `solids` over `under` (observed linear RGB).
+        `solids` (and `oil`) may be arrays of samples: the thicknesses a stroke actually lays (bristle ribbons,
+        tapering ends); the predicted colour is the average over them, as the eye averages a striped film.
         Returns (dict pigment->share, predicted linear RGB, delta E)."""
-        R, T = self.layer(solids, oil)
+        sol = np.atleast_1d(np.asarray(solids, float)); oil_ = np.broadcast_to(np.atleast_1d(np.asarray(oil, float)), sol.shape)
         Rb = np.asarray(under_linear)[None, :3]
-        Rt = R[:, :3] + T[:, :3] ** 2 * Rb / (1 - R[:, :3] * Rb)
+        Rt = 0; Tm = 0
+        for s_, o_ in zip(sol, oil_):
+            R, T = self.layer(s_, o_)
+            Rt = Rt + (R[:, :3] + T[:, :3] ** 2 * Rb / (1 - R[:, :3] * Rb)) / len(sol); Tm = Tm + T[:, :3].mean(1) / len(sol)
         dE = np.linalg.norm(lab(Rt) - lab(np.asarray(target_linear)[None, :3]), axis=1)
-        if opacity_bias: dE = dE + opacity_bias * T[:, :3].mean(1)
+        if opacity_bias: dE = dE + opacity_bias * Tm             # a painter covers with opaque paint rather than tint
         i = int(np.argmin(dE))
         return {self.pigments[c]: w for c, w in self.mixes[i].items()}, Rt[i], float(dE[i])
