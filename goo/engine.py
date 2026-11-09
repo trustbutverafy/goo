@@ -32,6 +32,8 @@ PIGMENTS = {
     "sienna":      dict(K=[0.30, 1.25, 2.40, 0.08], S=[0.30, 0.20, 0.10, 0.12]),
     "rose":        dict(K=[0.10, 2.30, 0.85, 0.02], S=[0.03, 0.02, 0.04, 0.02]),
     "green":       dict(K=[1.60, 0.30, 1.90, 0.10], S=[0.06, 0.08, 0.04, 0.05]),
+    "yellow":      dict(K=[0.04, 0.12, 2.80, 0.02], S=[0.90, 0.85, 0.35, 0.30]),    # cadmium-like, opaque
+    "red":         dict(K=[0.06, 2.60, 2.20, 0.03], S=[0.90, 0.30, 0.25, 0.30]),    # vermilion-like, opaque
 }
 GROUND_RGBN = np.array([0.93, 0.92, 0.88, 0.90])   # gesso, visible and near-infrared
 
@@ -84,13 +86,13 @@ class Canvas:
         self.L = dict(G=1.0, eta0=0.12, phi_m=0.64, phi_y=0.2, tau0=0.05, tau_cure=1.0, D0=0.15, evap=0.0006, edge_evap=0.006,
                       absorb=0.004 if ground == "gesso" else 0.04, store_cap=0.08, store_evap=0.002,
                       cure_rate=0.0, cure_stiff=400.0, cure_yield=300.0, drag_range=1.4,
-                      flow=1.0, drag=1.0, diffusion=1.0, evaporation=1.0, absorption=1.0, curing=1.0, max_sub=600, flow_sub=48, h_pin=0.08)
+                      flow=1.0, drag=1.0, diffusion=1.0, evaporation=1.0, absorption=1.0, curing=1.0, max_sub=600, flow_sub=48, h_pin=0.08, lazy=1)
         if laws: self.L.update(laws)
         self.U = np.zeros((2, H, W))                        # tool velocity imposed this step (cells / step)
         self.V = np.zeros((2, H, W))                        # plough: paint squeezed out from under a tool
         self.led = dict(loaded=np.zeros(len(self.species)), evaporated=0.0, store_evaporated=0.0)
         self.brushes = []
-        self.t = 0; self.substeps = 0; self.capped = 0
+        self.t = 0; self.substeps = 0; self.capped = 0; self.pending = 0
 
     # ---- putting paint down by hand (setups, tests): booked as loaded, like anything a brush brings
     def add(self, name, field):
@@ -116,50 +118,67 @@ class Canvas:
 
     # ---- the tool velocity: imposed where tools touch, spread sideways by a screened Poisson solve
     def _drag_velocity(self):
-        if self.L["drag"] == 0 or not (self.U.any() or self.V.any()): return None
-        pad = 24; H, W = self.H + 2 * pad, self.W + 2 * pad
-        ky = np.fft.fftfreq(H)[:, None] * 2 * np.pi; kx = np.fft.rfftfreq(W)[None, :] * 2 * np.pi
+        """The tool velocity where tools touched this tick: U spread sideways by a screened Poisson solve
+        (range drag_range), plus the unspread plough V. Solved in a window around the touch, not the panel.
+        Returns (u[2, h, w], (y0, y1, x0, x1)) or None."""
+        if self.L["drag"] == 0: return None
+        act = (self.U != 0).any(0) | (self.V != 0).any(0)
+        if not act.any(): return None
+        ys, xs = np.nonzero(act); m = 12                       # the kernel has decayed by e^-8 at 12 cells
+        y0, y1 = max(0, ys.min() - m), min(self.H, ys.max() + 1 + m); x0, x1 = max(0, xs.min() - m), min(self.W, xs.max() + 1 + m)
+        pad = 12; Hh, Ww = (y1 - y0) + 2 * pad, (x1 - x0) + 2 * pad
+        ky = np.fft.fftfreq(Hh)[:, None] * 2 * np.pi; kx = np.fft.rfftfreq(Ww)[None, :] * 2 * np.pi
         filt = 1 / (1 + self.L["drag_range"] ** 2 * (kx ** 2 + ky ** 2))
         out = []
         for c in range(2):
-            a = np.pad(self.U[c], pad)
-            out.append(np.fft.irfft2(np.fft.rfft2(a) * filt, s=(H, W))[pad:-pad, pad:-pad])
-        u = (np.stack(out) + self.V) * self.L["drag"]
-        return u * (self.h > 1e-9)                          # only paint is carried
+            a = np.pad(self.U[c, y0:y1, x0:x1], pad)
+            out.append(np.fft.irfft2(np.fft.rfft2(a) * filt, s=(Hh, Ww))[pad:-pad, pad:-pad])
+        u = (np.stack(out) + self.V[:, y0:y1, x0:x1]) * self.L["drag"]
+        return u * (self.h[y0:y1, x0:x1] > 1e-9), (y0, y1, x0, x1)   # only paint is carried
 
-    # ---- one step of unit time, in as many substeps as the stiffest process needs
+    # ---- time. Two clocks: tools act every tick, locally; the slow laws (leveling, colour, drying, curing)
+    #      catch up every L["lazy"] ticks with the whole elapsed time, at their own stability limits.
+    #      Conservative either way; with lazy = 1 every law runs every tick.
     def step(self):
         L = self.L
-        u = self._drag_velocity()
-        # operator split: (a) the tools carry paint, in the box where their velocity matters, at the tool's CFL;
-        #                 (b) leveling, colour diffusion, drying over the whole panel, at their own limits
-        if u is not None:
+        d = self._drag_velocity()
+        if d is not None:
+            u, (Y0, Y1, X0, X1) = d
             umax = np.abs(u).max()
-            live = (np.abs(u) > 1e-3 * umax).any(0)
-            ys, xs = np.nonzero(live)
-            y0, y1 = max(0, ys.min() - 3), min(self.H, ys.max() + 4); x0, x1 = max(0, xs.min() - 3), min(self.W, xs.max() + 4)
-            nt = int(np.ceil(max(1.0, umax / 0.5)))
-            if nt > L["max_sub"]: self.capped += 1; nt = L["max_sub"]
-            ub = u[:, y0:y1, x0:x1]
-            ux = 0.5 * (ub[0][:, :-1] + ub[0][:, 1:]); uy = 0.5 * (ub[1][:-1, :] + ub[1][1:, :])
-            for _ in range(nt):
-                qb = self.q[:, y0:y1, x0:x1]
-                Fx, Fy = limit(muscl_flux(qb, ux, -1, 1.0 / nt), muscl_flux(qb, uy, -2, 1.0 / nt), qb)
-                qb[..., :, :-1] -= Fx; qb[..., :, 1:] += Fx; qb[..., :-1, :] -= Fy; qb[..., 1:, :] += Fy
-                np.maximum(qb, 0, out=qb)
-            self.substeps += nt
+            if umax > 0:
+                live = (np.abs(u) > 1e-3 * umax).any(0)
+                ys, xs = np.nonzero(live)
+                y0, y1 = max(0, ys.min() - 3), min(Y1 - Y0, ys.max() + 4); x0, x1 = max(0, xs.min() - 3), min(X1 - X0, xs.max() + 4)
+                nt = int(np.ceil(max(1.0, umax / 0.5)))
+                if nt > L["max_sub"]: self.capped += 1; nt = L["max_sub"]
+                ub = u[:, y0:y1, x0:x1]
+                ux = 0.5 * (ub[0][:, :-1] + ub[0][:, 1:]); uy = 0.5 * (ub[1][:-1, :] + ub[1][1:, :])
+                for _ in range(nt):
+                    qb = self.q[:, Y0 + y0:Y0 + y1, X0 + x0:X0 + x1]
+                    Fx, Fy = limit(muscl_flux(qb, ux, -1, 1.0 / nt), muscl_flux(qb, uy, -2, 1.0 / nt), qb)
+                    qb[..., :, :-1] -= Fx; qb[..., :, 1:] += Fx; qb[..., :-1, :] -= Fy; qb[..., 1:, :] += Fy
+                    np.maximum(qb, 0, out=qb)
+                self.substeps += nt
+            self.U[:, Y0:Y1, X0:X1] = 0; self.V[:, Y0:Y1, X0:X1] = 0
+        self.t += 1; self.pending += 1
+        if self.pending >= L["lazy"]: self.flush()
+
+    def flush(self):
+        """Run the slow laws over the elapsed ticks not yet accounted for."""
+        dt = self.pending
+        if dt <= 0: return
+        L = self.L
         h = self.h; phi = self.phi(); eta = self.eta(phi)
         # Bingham mobility from the yielded depth Y only: a paste below its yield stress doesn't set the step
         gy, gx = np.gradient(L["G"] * (h + self.zb)); ag = np.hypot(gx, gy) + 1e-300
         Y = np.clip(h - self.tau(phi) / ag, 0, None)
         mob = (Y * Y * (3 * h - Y) / (6 * eta)).max() * L["flow"]
         D = (L["D0"] * L["eta0"] / eta).max() * L["diffusion"]
-        n_flow = min(4.4 * L["G"] * mob / 0.8, L["flow_sub"])    # beyond this the face cap keeps it stable
-        n = int(np.ceil(max(1.0, n_flow, 4 * D / 0.8)))
-        if n > L["max_sub"]: self.capped += 1; n = L["max_sub"]
-        for _ in range(n): self._sub(1.0 / n)
-        self.substeps += n; self.t += 1
-        self.U[:] = 0; self.V[:] = 0
+        n_flow = min(4.4 * L["G"] * mob / 0.8, L["flow_sub"]) * dt  # beyond flow_sub the face cap keeps it stable
+        n = int(np.ceil(max(1.0, n_flow, 4 * D * dt / 0.8)))
+        if n > L["max_sub"] * dt: self.capped += 1; n = int(L["max_sub"] * dt)
+        for _ in range(n): self._sub(dt / n)
+        self.substeps += n; self.pending = 0
 
     def _sub(self, dt):
         L, q = self.L, self.q
@@ -214,6 +233,7 @@ class Canvas:
     # ---- stratigraphy: what is dry becomes a layer the wet paint sits on and can no longer move
     def fix(self, cure_min=0.8):
         """Fix every cell whose paint is dry: no water left, and either lean (little oil) or cured."""
+        self.flush()
         q = self.q; h = q.sum(0)
         ok = (h > 0) & (q[0] <= 1e-6) & ((q[1] <= 0.05 * np.maximum(h, 1e-12)) | (self.kappa >= cure_min))
         self.led["evaporated"] += (q[0] * ok).sum()
@@ -225,10 +245,11 @@ class Canvas:
 
     def wait(self, steps, evap_boost=1.0, cure_boost=1.0, flow=None):
         """Let time pass (a drying lamp, a day, a month): the same laws, with drying and curing sped up."""
-        keep = dict(self.L)
+        self.flush(); keep = dict(self.L)
         self.L["evap"] *= evap_boost; self.L["edge_evap"] *= evap_boost; self.L["store_evap"] *= evap_boost
         self.L["cure_rate"] *= cure_boost
         for _ in range(steps): self.step()
+        self.flush()
         self.L.update(keep)
 
     # ---- bookkeeping

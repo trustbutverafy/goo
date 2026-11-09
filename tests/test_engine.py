@@ -144,3 +144,17 @@ def test_determinism():
         for _ in range(20): c.step()
         return c.q
     assert np.array_equal(session(), session())
+
+
+def test_lazy_clock_conserves_and_agrees():
+    """Slow laws batched every 25 ticks: same books, and the paint ends up close to the every-tick result."""
+    def session(lazy):
+        cv = Canvas(100, 70, ["ultramarine", "white"], laws=dict(lazy=lazy, cure_rate=0.002))
+        b = Brush(cv, 12, load=Brush.paint("oil", 0.48, 3000, {"ultramarine": 1, "white": 2}))
+        b.stroke([(10, 20), (90, 25)]); b.stroke([(10, 45), (90, 35)]); b.stroke([(50, 5), (50, 65)])
+        for _ in range(100): cv.step()
+        cv.flush(); return cv
+    a, b = session(1), session(25)
+    assert worst_residual(b) < 1e-9 and b.q.min() >= 0
+    assert a.t == b.t
+    assert np.abs(a.h - b.h).mean() < 0.05 * a.h[a.h > 0.01].mean()
