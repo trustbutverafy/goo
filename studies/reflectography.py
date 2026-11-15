@@ -6,9 +6,7 @@ from goo.engine import Canvas
 from goo.sensors.lidar import CELL, grid
 from goo.sensors.coherent import Surface, Geometry
 cv = pickle.load(open("out/pear.canvas.pkl", "rb")); H, W = cv.H, cv.W; Wm, Hm = W * CELL, H * CELL
-Z = cv.surface() * CELL; nir = cv.reflectance()[..., 3]
-oilfrac = cv.q[1] / np.maximum(cv.h, 1e-9); gloss = np.clip(cv.h / 0.3, 0, 1) * np.clip(oilfrac / 0.3, 0, 1)
-surf = Surface(Z, nir, 1.5 * (1 - gloss) + 0.3 * gloss)
+surf = Surface.from_canvas(cv); Z, nir = surf.Z_mm, surf.nir   # what the World presents to a sensor (SPEC §6)
 box = (18, 42, 26, 46)                                       # mm: the first pear's contour, under the background
 g = Geometry(surf, (-0.64 * 150 + Wm / 2, Hm / 2, 0.77 * 150), spacing=0.14, spot=0.12, aim_box=box, seed=2)
 coal = cv.strata[0][cv.idx("carbon")]

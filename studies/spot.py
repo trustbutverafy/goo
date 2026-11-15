@@ -35,11 +35,8 @@ print(f"[{time.time()-T0:5.0f}s] flat sweep done", flush=True)
 # ---------------------------------------------------------------- 2. the painting
 cv = pickle.load(open("out/pear.canvas.pkl", "rb"))
 H, W = cv.H, cv.W; Wm, Hm = W * CELL, H * CELL
-Z = cv.surface() * CELL; R4 = cv.reflectance(); nir = R4[..., 3]
-oilfrac = cv.q[1] / np.maximum(cv.h, 1e-9)
-gloss = np.clip(cv.h / 0.3, 0, 1) * np.clip(oilfrac / 0.3, 0, 1)
-rough = 1.5 * (1 - gloss) + 0.3 * gloss                         # um: matte gesso / dry watercolour vs an oil film
-surf = Surface(Z, nir, rough)
+surf = Surface.from_canvas(cv)                                  # what the World presents to a sensor (SPEC §6)
+Z, R4, nir, gloss, rough = surf.Z_mm, surf.reflectance, surf.nir, surf.gloss, surf.rough_um
 stations = {"left": (-0.64 * 150 + Wm / 2, Hm / 2, 0.77 * 150), "right": (0.64 * 150 + Wm / 2, Hm / 2, 0.77 * 150)}
 geo = {k: Geometry(surf, p, spacing=0.14, spot=0.12, seed=i + 3) for i, (k, p) in enumerate(stations.items())}
 print(f"[{time.time()-T0:5.0f}s] geometry: {sum(g.B for g in geo.values())} beams x {geo['left'].N} scatterers", flush=True)

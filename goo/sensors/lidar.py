@@ -32,8 +32,11 @@ class Scanner:
         self.sigma, self.glint = sigma_range, glint
         self.rng = np.random.default_rng(seed)
 
-    def scan(self, Z, nir, gloss, rgb):
-        """Z: (H, W) surface height in mm. nir: (H, W) reflectance at 1550 nm. gloss: (H, W) 0..1. rgb: (H, W, 3)."""
+    def scan(self, Z, nir=None, gloss=None, rgb=None):
+        """scan(surface): a goo.surface.Surface. Older form scan(Z, nir, gloss, rgb): Z (H, W) surface height in mm,
+        nir (H, W) reflectance at 1550 nm, gloss (H, W) 0..1, rgb (H, W, 3)."""
+        if nir is None and gloss is None and rgb is None and hasattr(Z, "Z_mm"):
+            Z, nir, gloss, rgb = Z.Z_mm, Z.nir, Z.gloss, Z.rgb
         H, W = Z.shape; Wm, Hm = W * CELL, H * CELL
         zmax, zmin = Z.max() + 0.05, Z.min() - 0.05
         # aim points on a grid over the panel at z = mean; directions from the station through them

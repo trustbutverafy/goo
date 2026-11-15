@@ -15,7 +15,10 @@ dependencies = ["numpy>=1.24", "scipy>=1.10", "scikit-image>=0.21", "matplotlib>
 dev = ["pytest>=7"]
 
 [tool.setuptools]
-packages = ["goo", "goo.sensors"]
+packages = ["goo", "goo.sensors", "goo.data", "goo.matter"]
+
+[tool.setuptools.package-data]
+"goo.data" = ["*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

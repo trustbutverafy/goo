@@ -1,4 +1,4 @@
-"""The Sensor contract (SPEC.md §5): calibrated precision, speckle where coherence says there must be speckle,
+"""The Sensor contract (SPEC.md §7): calibrated precision, speckle where coherence says there must be speckle,
 and looks that help the way independent looks should."""
 import numpy as np
 import pytest
@@ -51,3 +51,21 @@ def test_sensor_sees_only_the_surface():
     import inspect
     src = inspect.getsource(Geometry)
     assert "species" not in src and ".q[" not in src and "strata" not in src
+
+
+def test_relight_sees_only_the_surface():
+    # the same rule, for the visible-light sensor: its whole module, by source and by what it touches
+    import ast, inspect
+    import goo.sensors.relight as relight
+    src = inspect.getsource(relight)
+    assert "species" not in src and ".q[" not in src and "strata" not in src and "Canvas" not in src
+    tree = ast.parse(src)
+    attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    world = {"q", "strata", "species", "kappa", "led", "ledger", "zb", "store", "brushes", "flush", "step", "fix", "wait", "surface"}
+    assert not attrs & world, attrs & world
+    imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names} | \
+               {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+    assert imported <= {"numpy", "__future__"}, imported
+    # what it reads of a Surface: Z_mm, rgb, gloss, cell_mm, and nothing else
+    read = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "surface"}
+    assert read == {"Z_mm", "rgb", "gloss", "cell_mm"}, read

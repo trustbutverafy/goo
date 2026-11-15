@@ -1,5 +1,5 @@
 """Scan a finished painting with the lidar (averaged spot = direct-detection intensity), then look at what came back."""
-import json, pickle, sys
+import json, pickle, sys, zlib
 import numpy as np
 from scipy import ndimage
 import matplotlib; matplotlib.use("Agg")
@@ -7,7 +7,9 @@ import matplotlib.pyplot as plt
 from PIL import Image
 
 from goo.engine import Canvas
+from goo.surface import Surface
 from goo.sensors.lidar import Scanner, grid, write_ply, CELL, bilinear
+from goo.sensors import relight
 
 import os
 CANVAS = os.environ.get("CANVAS", "out/pear.canvas.pkl")
@@ -15,23 +17,20 @@ OUT = os.environ.get("OUT", "out"); NAME = os.environ.get("NAME", "pear")
 cv = pickle.load(open(CANVAS, "rb"))
 H, W = cv.H, cv.W; Wm, Hm = W * CELL, H * CELL
 
-# ---- what the World presents to a sensor: a surface and its optics (never the species)
-Z = cv.surface() * CELL                                   # mm
-R = cv.reflectance()                                      # (H, W, 4): R, G, B, 1550 nm
-nir = R[..., 3]; rgb = R[..., :3]
-oilfrac = cv.q[1] / np.maximum(cv.h, 1e-9)
-gloss = np.clip(cv.h / 0.3, 0, 1) * np.clip(oilfrac / 0.3, 0, 1)   # a wet or cured oil film is glossy; dried watercolour is matte
+# ---- what the World presents to a sensor: a Surface (height, reflectance per band, roughness, gloss), never the species
+surf = Surface.from_canvas(cv)
+Z, nir, rgb, gloss = surf.Z_mm, surf.nir, surf.rgb, surf.gloss
 
 # ---- two stations, 150 mm out, 40 degrees off the normal, either side
 stations = {}
 for name, pos in {"left": (-0.64 * 150 + Wm / 2, Hm / 2, 0.77 * 150), "right": (0.64 * 150 + Wm / 2, Hm / 2, 0.77 * 150)}.items():
-    sc = Scanner(pos, spacing=0.14, spot=0.12, sub=4, sigma_range=0.008, seed=hash(name) % 1000)
-    stations[name] = sc.scan(Z, nir, gloss, rgb)
+    sc = Scanner(pos, spacing=0.14, spot=0.12, sub=4, sigma_range=0.008, seed=zlib.crc32(name.encode()) % 1000)   # hash() of a str changes per process
+    stations[name] = sc.scan(surf)
     s = stations[name]; print(f"{name}: {s['n_hits']}/{s['n_rays']} returns", flush=True)
 # a third, grazing station (78 deg off the normal, from the left), kept out of the merged cloud: a raking scan,
 # where impasto does cast lidar shadows
 graze = Scanner((Wm / 2 - 150 * np.sin(np.radians(78)), Hm / 2, 150 * np.cos(np.radians(78))), spacing=0.14, spot=0.12, sub=4, seed=5)
-gs_ = graze.scan(Z, nir, gloss, rgb); print(f"grazing: {gs_['n_hits']}/{gs_['n_rays']} returns", flush=True)
+gs_ = graze.scan(surf); print(f"grazing: {gs_['n_hits']}/{gs_['n_rays']} returns", flush=True)
 xyz = np.concatenate([s["xyz"] for s in stations.values()]); I = np.concatenate([s["intensity"] for s in stations.values()])
 col = np.concatenate([s["rgb"] for s in stations.values()]); cos = np.concatenate([s["cos"] for s in stations.values()])
 # PLY in a right-handed frame (x right, y up the panel, z out of it)
@@ -51,7 +50,8 @@ stats = dict(points=int(len(xyz)), per_station={k: dict(rays=s["n_rays"], return
              height_rmse_um=float(np.sqrt(np.mean(err ** 2)) * 1000), height_p99_um=float(np.percentile(np.abs(err), 99) * 1000),
              shadowed_left=float(1 - cov["left"][inner].mean()), shadowed_right=float(1 - cov["right"][inner].mean()),
              unseen_merged=float(holes[inner].mean()), shadowed_grazing_78deg=float(1 - cov_g[inner].mean()),
-             paint_max_mm=float((cv.surface() - cv.g).max() * CELL), relief_range_mm=float(Z.max() - Z.min()))
+             paint_max_mm=float((cv.surface() - cv.g).max() * CELL), relief_range_mm=float(Z.max() - Z.min()),
+             gloss_mean=float(gloss.mean()), glossy_fraction=float((gloss > 0.5).mean()))
 print(json.dumps(stats, indent=1))
 
 # ---- renders
@@ -69,7 +69,9 @@ def raking(Zmm, albedo, light=(-0.85, -0.35, 0.40), gl=None):
 
 srgb = lambda a: np.clip(a, 0, 1) ** (1 / 2.2)
 photo = srgb(rgb)
-rake = srgb(raking(Z, rgb, gl=gloss))
+# raking light from the upper left, 23.5 deg up, through the visible-light sensor; shown at exposure 1 / (lz + ambient)
+L_rake = relight.light_dir(22, 23.5)                     # where the old ad hoc light was
+rake = srgb(relight.render(surf, L_rake) / (L_rake[2] + 0.10))
 plt.imsave(f"{OUT}/{NAME}-photo.png", photo); plt.imsave(f"{OUT}/{NAME}-raking.png", rake)
 
 # peel the layers back (the painting's own stratigraphy, as the World holds it, for comparison)

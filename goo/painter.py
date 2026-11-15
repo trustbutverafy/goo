@@ -63,7 +63,41 @@ class Painter:
         self._swatches[key] = np.quantile(band, np.linspace(0.05, 0.95, 7)); return self._swatches[key]
 
     def see(self):
-        return self.cv.reflectance()[..., :3]
+        """What the painter sees: linear sRGB in daylight. Classic: the R, G, B bands, as always. Another optics
+        model: its reflectance, through the palette's model (which must be the canvas's: one code path)."""
+        R = self.cv.reflectance()
+        # >>> optics: see through the palette's optics model; refuse a palette that does not match the canvas
+        m = getattr(self.palette, "optics", None)
+        nb = 4 if m is None else m.bands.n
+        if R.shape[-1] != nb:
+            raise ValueError(f"the canvas shows {R.shape[-1]} bands but the palette's optics has {nb}: build the "
+                             f"palette with the canvas's optics model, Palette(..., optics=<the canvas's model>)")
+        if m is None: return R[..., :3]
+        self._seen_bands = R
+        return m.colour(R)
+        # <<< optics
+
+    @staticmethod
+    def under(seen, pts):
+        """The mean colour the painter sees along a path of (x, y) cells: what a stroke there will cover."""
+        H, W = seen.shape[:2]
+        return seen[np.clip([int(p[1]) for p in pts], 0, H - 1), np.clip([int(p[0]) for p in pts], 0, W - 1)].mean(0)
+
+    @staticmethod
+    def length(pts): return sum(np.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:]))
+
+    def mix(self, col, under, laid, phi, opacity_bias=6.0, cured=False):
+        """The mix that looks like `col` (linear RGB) when laid over what is seen `under`, averaged over the
+        thicknesses `laid` its brush really lays (a swatch) at solid fraction `phi`; once dry, if `cured`."""
+        return self.palette.match(col, under, laid * phi, oil=laid * (1 - phi), opacity_bias=opacity_bias, cured=cured)[0]
+
+    def lay(self, brush, pts, load, target, speed, pressure=1.0, taper=0.35):
+        """Charge `brush` with `load` and draw it through `pts` (cells), pressing hardest mid-stroke and `taper`
+        lighter at the ends. Returns the path with its pressures."""
+        brush.charge(load); m = len(pts)
+        prof = [(p[0], p[1], pressure * ((1 - taper) + taper * np.sin(np.pi * (j + 0.5) / m))) for j, p in enumerate(pts)]
+        brush.stroke(prof, speed=speed, target=target)
+        return prof
 
     def _orientation(self, img, R):
         """Stroke directions: the minor eigenvector of the colour structure tensor, smoothed at scale R."""
@@ -112,7 +146,6 @@ class Painter:
         width = max(2.0, width_scale * R)
         brush = Brush(cv, width, bristles=bristles or max(1, int(width / 2.5)), exchange=exchange, drag=drag, plough=plough)
         laid = self.swatch(width, target, drag, plough, phi, exchange, speed)    # what this brush really lays
-        solids = laid * phi                                                  # seven thicknesses, not one
         painted = np.zeros((H, W), bool)                                     # where this pass has already been
         n = 0
         for (y, x) in starts:
@@ -133,14 +166,10 @@ class Painter:
                 px, py, ldx, ldy = nx, ny, dx, dy; pts.append((px, py))
             if len(pts) < 2:                                                     # a dab
                 a = np.arctan2(dy_[y, x], dx_[y, x]) + self.rng.normal(0, 0.2); pts = [(x + 0.5 - 0.5 * R * np.cos(a), y + 0.5 - 0.5 * R * np.sin(a)), (x + 0.5 + 0.5 * R * np.cos(a), y + 0.5 + 0.5 * R * np.sin(a))]
-            ix_ = np.clip([int(q[1]) for q in pts], 0, H - 1); jx_ = np.clip([int(q[0]) for q in pts], 0, W - 1)
-            under = seen[ix_, jx_].mean(0)                                   # what the whole stroke will cover
-            mix, pred, dE = self.palette.match(col, under, solids, oil=laid * (1 - phi), opacity_bias=opacity_bias)
-            length = sum(np.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:])) + R
-            brush.charge(paint(mix, load_factor * length * width * target))
-            m = len(pts)
-            prof = [(p[0], p[1], pressure * (0.65 + 0.35 * np.sin(np.pi * (j + 0.5) / m))) for j, p in enumerate(pts)]
-            brush.stroke(prof, speed=max(1.5, speed * width), target=target)
+            under = self.under(getattr(self, "_seen_bands", seen) if getattr(self.palette, "optics", None) is not None else seen, pts)   # what the whole stroke will cover (optics: in the model's bands)
+            mix = self.mix(col, under, laid, phi, opacity_bias)
+            length = self.length(pts) + R
+            prof = self.lay(brush, pts, paint(mix, load_factor * length * width * target), target, max(1.5, speed * width), pressure)
             for (qx, qy, _) in prof:
                 r0 = int(width * 0.35); yy0, xx0 = int(qy), int(qx)
                 painted[max(0, yy0 - r0):yy0 + r0 + 1, max(0, xx0 - r0):xx0 + r0 + 1] = True

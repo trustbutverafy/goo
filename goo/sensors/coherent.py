@@ -15,6 +15,7 @@ is kept beside the measurement, never mixed into it.
 """
 import numpy as np
 from goo.sensors.lidar import bilinear, CELL
+from goo.surface import Surface   # it lives in goo.surface; imported here for compatibility
 
 C = 299_792_458.0
 
@@ -50,13 +51,6 @@ def march(o, d, Z, zmax, zmin, step=0.03, bisect=12):
     H, W = Z.shape
     inside = (p[:, 0] > 0) & (p[:, 0] < W * CELL) & (p[:, 1] > 0) & (p[:, 1] < H * CELL)
     return hi, found & inside
-
-
-class Surface:
-    """What the World presents to a sensor: height (mm), 1550 nm reflectance, roughness (um)."""
-    def __init__(self, Z, nir, rough_um):
-        self.Z, self.nir, self.rough = Z, nir, rough_um
-        gy, gx = np.gradient(Z, CELL); self.gx, self.gy = gx, gy
 
 
 class Geometry:
