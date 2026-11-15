@@ -10,7 +10,7 @@ DIRECT = {
     "light": ["film", "substance", "ledger"],
     "world": ["film", "substance", "ledger"],
     "ports": ["world", "film", "substance", "ledger"],
-    "journal": ["world", "ports", "light"],
+    "journal": ["world", "ports", "light", "observe"],
     "observe": ["light", "film"],
     "lab": ["substance", "film", "light", "observe"],
 }

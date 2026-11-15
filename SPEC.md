@@ -33,7 +33,7 @@ goo.film        Film, Stack, Ground, Bands, Light, Environment: data   units, ev
 goo.light       layer operators, star product, looks, light ledger     film, substance, ledger
 goo.world       state, F, Psi*, the step, matter and energy ledgers    film, substance, ledger
 goo.ports       bodies and reservoirs coupled to the world             world, film, substance, ledger
-goo.journal     acts, replay, forks, clocks                            world, ports, light
+goo.journal     acts, replay, forks, clocks, looks as pictures         world, ports, light, observe
 goo.observe     sensors: measurement models over looks                 light, film
 goo.lab         drawdowns, data sheets, admissibility reports, search  substance, film, light, observe
 goo.classic     the first engine, deprecated                           itself
@@ -396,7 +396,7 @@ substance                  goo/substance/, tests/substance/, docs/SUBSTANCES.md 
 dynamics                   docs/DYNAMICS.md, goo/world/, tests/world/                           first wave
 light                      goo/light/, tests/light/, docs/LIGHT.md                              first wave
 referee                    tests/contract/, tests/limits/, tests/oracle/, docs/NEGATIVE.md      after the first wave
-ports, journal, clocks     goo/ports/, goo/journal/, tests/ports/, tests/journal/               second wave
+ports, journal, clocks     goo/ports/, goo/journal/, tests/ports/, tests/journal/, docs/PORTS.md, docs/JOURNAL.md   second wave
 lab and observers          goo/lab/, goo/observe/, tests/lab/, tests/observe/, docs/LAB.md, docs/OBSERVE.md   second wave
 lead                       SPEC.md, AGENTS.md, README.md, goo/units.py, goo/evidence.py, goo/ledger.py, goo/film.py,
                            tests/test_shared.py, tests/test_layering.py, integration
