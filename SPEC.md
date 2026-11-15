@@ -376,7 +376,10 @@ K1  docs/DYNAMICS.md; the step with O1 to O8 on the first terms              bui
     and fails on three substances at that size); cure (needs the reaction's free energy) and dissolution (xfail);
     surface tension is lagged (no Marangoni stress)
 K2  light on the first rung with G1 to G7                                    built; owner's tests pass (tests/light/); not yet refereed
-K3  ports, the first bodies, journal, replay, clocks                         not begun
+K3  ports, the first bodies, journal, replay, clocks                         built without a mechanical port: paints, vessels, pour, flood, drop, drip,
+    spray, tape, tilt, air, wait, hold, settle; a journal with bit-identical replay; a command line. NOT PASSING against
+    the current world: its suite fails where World.advance cannot take a step on real paint (owed by the world), and a
+    1024 x 768 session costs about 1 GB of disk for five acts (owed by the journal). No brush or blade.
 K4  the lab and observers                                                    built; owner's tests pass (tests/lab/, tests/observe/); not yet refereed
     owed: the observer's fit is unverified and the daylight is a 6504 K blackbody; no gain saturation; no coalescence
     term for latex; known wrong results are listed in docs/LAB.md §8
