@@ -1,0 +1,123 @@
+"""What the three substeps share: the context of a step on a window, mixing evaluated on compacted cells, and
+the increments of F's terms (computed from increments, not differences of totals: DYNAMICS.md §5)."""
+from dataclasses import dataclass
+import numpy as np
+from goo.film import Film
+from goo.world.protocol import call
+
+
+class Reject(Exception):
+    """A substep whose acceptance condition failed: the step is redone as two half steps."""
+
+
+@dataclass
+class Ctx:
+    grid: object
+    substances: tuple
+    rho: np.ndarray          # [S]
+    con: object              # the Constitutive
+    env: object
+    ground: object
+    zb: np.ndarray           # [N]
+    r: np.ndarray            # [N] clock rate
+    gam_f: np.ndarray        # [nF] lagged
+    Swet: np.ndarray         # [N] lagged, or None
+    ell: np.ndarray          # [N]
+    P: np.ndarray            # [S, N] lagged, or None
+    Pb: np.ndarray           # [N]
+    cap: float               # pore capacity, m
+    a: float                 # gravity split density
+    mu_env: np.ndarray       # [S], 0 where no reservoir
+    has_env: np.ndarray      # [S] bool
+    flags: list
+
+    @property
+    def g(self):
+        return self.env.gravity
+
+
+def film_of(ctx, q, cells=None):
+    """A Film of the window (cells None) or of compacted cells, shape [S, 1, n]."""
+    if cells is None:
+        return Film(ctx.substances, q.reshape(len(ctx.substances), ctx.grid.H, ctx.grid.W))
+    return Film(ctx.substances, q[:, cells][:, None, :])
+
+
+def coeff(ctx, name, q, cells, *extra):
+    """A constitutive function evaluated on compacted cells, flattened; None if absent."""
+    v = call(ctx.con, name, film_of(ctx, q, cells), *extra, flags=ctx.flags)
+    if v is None:
+        return None
+    if isinstance(v, tuple):
+        return tuple(np.asarray(x, np.float64).reshape(np.asarray(x).shape[:-2] + (-1,)) for x in v)
+    v = np.asarray(v, np.float64)
+    return v.reshape(v.shape[:-2] + (-1,))
+
+
+def mixing(ctx, qc):
+    """Mixing on compacted cells qc [S, n]: (f, mu, hess, f_x, mu_x) flattened, with empty cells and absent
+    substances masked to zero. None if the term is absent."""
+    S, n = qc.shape
+    fn = getattr(ctx.con, "mixing", None)
+    if fn is None:
+        return None
+    with np.errstate(divide="ignore", invalid="ignore"):
+        from goo.world.protocol import unwrap
+        mx = unwrap(fn(Film(ctx.substances, qc[:, None, :]), ctx.env.T), "mixing", ctx.flags)
+    if mx is None:
+        return None
+    present = qc > 0
+    wet = qc.sum(0) > 0
+    f = np.where(wet, np.asarray(mx.f, np.float64).reshape(n), 0.0)
+    mu = np.where(present, np.asarray(mx.mu, np.float64).reshape(S, n), 0.0)
+    pp = present[:, None, :] & present[None, :, :]
+    H = np.where(pp, np.asarray(mx.hess, np.float64).reshape(S, S, n), 0.0)
+    fx = np.zeros(n) if mx.f_x is None else np.where(wet, np.asarray(mx.f_x, np.float64).reshape(n), 0.0)
+    mux = np.zeros((S, n)) if mx.mu_x is None else np.where(present, np.asarray(mx.mu_x, np.float64).reshape(S, n), 0.0)
+    return f, mu, H, fx, mux
+
+
+def dF_grav(ctx, cells, q0, dq):
+    """Increment of F_grav on compacted cells for a change dq [S, n]: exact for this quadratic."""
+    gx, gy, gn = ctx.g
+    h, m = q0.sum(0), ctx.rho @ q0
+    dh, dm = dq.sum(0), ctx.rho @ dq
+    psi = -(gx * ctx.grid.X[cells] + gy * ctx.grid.Y[cells])
+    per = gn * (dm * ctx.zb[cells] + 0.5 * (dm * h + m * dh + dm * dh)) + dm * psi
+    return ctx.grid.dx ** 2 * np.sum(per)
+
+
+def dF_cap(ctx, faces, h0, dh):
+    """Increment of F_cap over the given faces for a change dh [N] of the window's thickness."""
+    G = ctx.grid
+    s = ctx.zb + h0
+    d = s[G.fR[faces]] - s[G.fL[faces]]
+    dd = dh[G.fR[faces]] - dh[G.fL[faces]]
+    return np.sum(ctx.gam_f[faces] * (d * dd + 0.5 * dd * dd))
+
+
+def dF_wet(ctx, cells, h0, dh):
+    if ctx.Swet is None:
+        return 0.0
+    S, l = ctx.Swet[cells], ctx.ell[cells]
+    per = (-S) * np.exp(-h0 / l) * (-np.expm1(-dh / l))
+    return ctx.grid.dx ** 2 * np.sum(per)
+
+
+def dF_exch(ctx, dq):
+    """Increment of F_exch for a change dq [S, n]."""
+    return -ctx.grid.dx ** 2 * np.sum(ctx.mu_env[:, None] * dq)
+
+
+def mu_wet(ctx, h, cells=None):
+    """d f_wet / dh per volume, J/m^3 (positive: thin films are costly)."""
+    if ctx.Swet is None:
+        return 0.0 if cells is None else np.zeros(len(cells))
+    S = ctx.Swet if cells is None else ctx.Swet[cells]
+    l = ctx.ell if cells is None else ctx.ell[cells]
+    hh = h if cells is None else h
+    return (-S / l) * np.exp(-hh / l)
+
+
+def pore_B(theta):
+    return -theta - np.log1p(-theta)
