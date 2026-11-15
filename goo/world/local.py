@@ -12,7 +12,7 @@ def local(ctx, q, held, dt):
     G = ctx.grid
     dx, N = G.dx, G.N
     S = q.shape[0]
-    rep = dict(D_exchange=0.0, D_sorption=0.0, dF=0.0, e=np.zeros(S), a=np.zeros(S), cells=np.zeros(0, np.int64))
+    rep = dict(D_exchange=0.0, D_sorption=0.0, dF=0.0, e=np.zeros(S), a=np.zeros(S), cells=np.zeros(0, np.int64), drained=0)
     h = q.sum(0)
     wet = (h > 0) & (ctx.r > 0)
     if not wet.any():
@@ -66,23 +66,37 @@ def local(ctx, q, held, dt):
     P = ctx.P[:, cells] if ctx.P is not None else np.zeros((S, n))
     Pb = ctx.Pb[cells] if ctx.P is not None else np.zeros(n)
 
-    def potentials(qp, idx):
-        """mu [S, m] and its Jacobian [m, S, S] at qp [S, m] for cells idx (positions in 0..n-1)."""
-        sg, mul = single[idx], np.empty_like(qp)
-        Hm = np.zeros((S, S, idx.size))
+    def potentials(qp, idx, need_hess=True):
+        """mu [S, m] at qp [S, m] for cells idx (positions in 0..n-1), and the mixing Hessian [S, S, m]: the Jacobian
+        of mu is that plus gJ + sig (jac())."""
+        sg = single[idx]
+        Hm = None
         if not nonmix:
-            mu_c = mx0[1][:, idx].copy(); Hm = mx0[2][:, :, idx].copy()
             mm = ~sg
-            if mm.any():
-                mxx = mixing(ctx, qp[:, mm])
-                mu_c[:, mm] = mxx[1]; Hm[:, :, mm] = mxx[2]
+            if mm.all():
+                mxx = mixing(ctx, qp)
+                mu_c, Hm = mxx[1], (mxx[2] if need_hess else None)
+            else:
+                mu_c = mx0[1][:, idx].copy()
+                if need_hess:
+                    Hm = mx0[2][:, :, idx].copy()
+                if mm.any():
+                    mxx = mixing(ctx, qp[:, mm])
+                    mu_c[:, mm] = mxx[1]
+                    if need_hess:
+                        Hm[:, :, mm] = mxx[2]
         else:
             mu_c = np.zeros_like(qp)
+        if Hm is None and need_hess:
+            Hm = np.zeros((S, S, idx.size))
         hp, mp = qp.sum(0), rho @ qp
         mul = (mu_c + mux0[:, idx] + base[:, idx] + gn * (mp + a_ * hp)[None, :] * (rho[:, None] + a_) / (4 * a_)
                + sig[idx][None, :] * hp[None, :])
-        Jm = np.moveaxis(Hm, 2, 0) + gJ[None] + sig[idx][:, None, None]
-        return mul, Jm
+        return mul, Hm
+
+    def jac(Hm, idx, rows, cols):
+        """The Jacobian of mu, d mu_rows / d q_cols [m, len(rows), len(cols)]."""
+        return np.moveaxis(Hm[rows][:, cols], 2, 0) + gJ[np.ix_(rows, cols)][None] + sig[idx][:, None, None]
 
     def pore(av, idx):
         th = (w0[idx] + av.sum(0)) / C if C > 0 else np.zeros(idx.size)
@@ -92,13 +106,21 @@ def local(ctx, q, held, dt):
 
     e = np.zeros((S, n)); av = np.zeros((S, n))
     live = np.flatnonzero(~single)                 # single-substance cells are bracketed below
-    I2 = np.eye(2 * S)
+    # the unknowns: e_i for the substances that exchange somewhere in the solve, a_i for those that are sorbed
+    # somewhere (every other e_i, a_i is identically zero, a row of the identity, and is left out of the system)
+    ie = np.flatnonzero(Eon[:, live].any(1)) if live.size else np.zeros(0, np.int64)
+    ia = np.flatnonzero(Son[:, live].any(1)) if live.size else np.zeros(0, np.int64)
+    ne, K = ie.size, ie.size + ia.size
+    if K == 0:
+        live = live[:0]
+    IK = np.eye(K)
+    gJ = np.asarray(gJ)
     for it in range(MAX_NEWTON):
         if live.size == 0:
             break
         idx = live
         qp = q0[:, idx] - e[:, idx] - av[:, idx]
-        mu, Jm = potentials(qp, idx)
+        mu, Hm = potentials(qp, idx)
         th, mup, Jp = pore(av[:, idx], idx)
         Xe = mu - menv[:, None]
         Xa = mu - mup
@@ -106,17 +128,25 @@ def local(ctx, q, held, dt):
         Re = np.where(Eon[:, idx], e[:, idx] - ke[:, idx] * Xe, e[:, idx])
         Ra = np.where(Son[:, idx], av[:, idx] - ks[:, idx] * np.where(pa, Xa, 0.0), av[:, idx])
         m_ = idx.size
-        J = np.zeros((m_, 2 * S, 2 * S))
         kE = np.where(Eon[:, idx], ke[:, idx], 0.0).T[:, :, None]         # [m, S, 1]
         kA = np.where(pa, ks[:, idx], 0.0).T[:, :, None]
-        J[:, :S, :S] = kE * Jm
-        J[:, :S, S:] = kE * Jm
-        J[:, S:, :S] = kA * Jm
-        J[:, S:, S:] = kA * (Jm + Jp[:, None, None])
-        J += I2[None]
-        Rv = np.concatenate([Re, Ra], 0).T                                # [m, 2S]
-        d = np.linalg.solve(J, -Rv[:, :, None])[:, :, 0]
-        de, da = d[:, :S].T, d[:, S:].T
+        if K == 1 and ne == 1:                                            # one exchanging substance: scalar
+            i0 = ie[0]
+            Jd = kE[:, i0, 0] * (Hm[i0, i0] + gJ[i0, i0] + sig[idx]) + 1.0
+            d = (-Re[i0] / Jd)[:, None]
+        else:
+            iea = np.concatenate([ie, ia])
+            Jm = jac(Hm, idx, iea, iea)                                   # [m, K, K]: rows (ie, ia), cols (ie, ia)
+            kk = np.concatenate([kE[:, ie, 0], kA[:, ia, 0]], 1)[:, :, None]
+            J = kk * Jm
+            if ia.size:
+                J[:, ne:, ne:] += kA[:, ia] * Jp[:, None, None]
+            J += IK[None]
+            Rv = np.concatenate([Re[ie], Ra[ia]], 0).T                    # [m, K]
+            d = np.linalg.solve(J, -Rv[:, :, None])[:, :, 0]
+        de = np.zeros((S, m_)); da = np.zeros((S, m_))
+        de[ie] = d[:, :ne].T
+        da[ia] = d[:, ne:].T
         dqp = -(de + da)
         t = np.ones(m_)
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -144,7 +174,7 @@ def local(ctx, q, held, dt):
 
         def mu_at(qv):
             qq = np.zeros((S, sidx.size)); qq[isub, cols] = qv
-            return potentials(qq, sidx)[0][isub, cols]
+            return potentials(qq, sidx, need_hess=False)[0][isub, cols]
 
         def a_at(muv):
             if not np.any(kA > 0) or C <= 0:
@@ -210,14 +240,16 @@ def local(ctx, q, held, dt):
                     aa = lo
                 ee = T - aa
             xi = ee / ke[i, j] + menv[i] if ee > 0 else aa / ks[i, j] + (-P[i, j] + Pb[j] * ((w0[j] + aa) / C) / (1 - (w0[j] + aa) / C))
-            mu00, _ = potentials(np.zeros((S, 1)), np.array([j]))
+            mu00, _ = potentials(np.zeros((S, 1)), np.array([j]), need_hess=False)
             if xi > mu00[i, 0] + 1e-9 * abs(mu00[i, 0]) + 1e-300:
                 raise Reject("local: drained cell violates its KKT condition")
             e[:, j] = 0.0; av[:, j] = 0.0
             e[i, j], av[i, j] = ee, aa
             q1[:, j] = 0.0
         q1[:, ~drain] = (q0 - e - av)[:, ~drain]
-    if np.any(q1 < 0) or np.any(e < 0) or np.any(av < 0):
+    # e < 0 is condensation (the film's potential is below the reservoir's: a gum-rich film takes water from the
+    # air); exchange is two-way (Psi* = r k (mu - mu°)^2 / 2), so only amounts and sorption (one-way) must be >= 0
+    if np.any(q1 < 0) or np.any(av < 0):
         raise Reject("local: negative amount")
     qn = q.copy(); qn[:, cells] = q1
     heldn = held.copy(); heldn[:, cells] = held[:, cells] + av
@@ -236,6 +268,6 @@ def local(ctx, q, held, dt):
     with np.errstate(divide="ignore", invalid="ignore"):
         De = np.where(Eon, e * e / ke, 0.0)
         Ds = np.where(Son & (av > 0), av * av / ks, 0.0)
-    rep.update(D_exchange=dx ** 2 * np.sum(De), D_sorption=dx ** 2 * np.sum(Ds), dF=dF,
+    rep.update(D_exchange=dx ** 2 * np.sum(De), D_sorption=dx ** 2 * np.sum(Ds), dF=dF, drained=int(drain.sum()),
                e=e.sum(1) * dx ** 2, a=av.sum(1) * dx ** 2, cells=cells)
     return qn, heldn, rep

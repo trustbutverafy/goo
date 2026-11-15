@@ -16,6 +16,11 @@ from goo.world.linsolve import SolveFailed, RTOL
 MAX_HALVINGS = 24
 
 
+class StepFailed(RuntimeError):
+    """A step that could not be accepted after MAX_HALVINGS halvings. The world is left exactly as it was before the
+    step (nothing of it is committed), so the caller may retry with another dt."""
+
+
 def _union(a, b):
     if a is None:
         return b
@@ -65,6 +70,7 @@ class World:
         for st in strata:
             self._push_stratum(np.array(st, np.float64))
         self._shared = False
+        self._version = 0                     # counts changes of the state (q, held, z_b, environment)
         self.env = environment if environment is not None else Environment()
         self.t = 0.0
         self.slope_bound, self.margin = float(slope_bound), int(margin)
@@ -217,8 +223,10 @@ class World:
     def F_recomputed(self):
         return self._F_box(self._full)
 
-    def _F_box(self, box, q=None, held=None, zb=None, lag=None):
-        """F by term over the cells of a box and the faces inside it, J."""
+    LAGGED_TERMS = ("capillary", "wetting", "sorption")       # the terms whose coefficients are lagged (§2)
+
+    def _F_box(self, box, q=None, held=None, zb=None, lag=None, terms=TERMS):
+        """F by term over the cells of a box and the faces inside it, J (only the terms named)."""
         sl = _sl(box)
         y0, y1, x0, x1 = box
         q = self.q[sl] if q is None else q
@@ -231,28 +239,34 @@ class World:
         X = ((x0 + np.arange(x1 - x0)) + 0.5) * self.dx
         Y = (((y0 + np.arange(y1 - y0)) + 0.5) * self.dx)[:, None]
         out = {}
-        out["gravity"] = dx2 * np.sum(gn * m * (zb + 0.5 * h) - m * (gxv * X[None, :] + gyv * Y))
-        s = zb + h
-        cap = 0.0
-        for gam, a_, b_ in ((c["gx"], np.s_[:, 1:], np.s_[:, :-1]), (c["gy"], np.s_[1:, :], np.s_[:-1, :])):
-            dh, ds, dz = h[a_] - h[b_], s[a_] - s[b_], zb[a_] - zb[b_]
-            cap += np.sum(0.5 * gam * dh * (ds + dz))
-        out["capillary"] = cap
-        out["wetting"] = dx2 * np.sum((-c["Sw"]) * (-np.expm1(-h / c["ell"]))) if self._has_wet else 0.0
-        wetc = np.flatnonzero(h.ravel() > 0)
-        mixf = 0.0
-        if wetc.size:
-            mx = mixing(self._ctx_stub(), q.reshape(len(self.substances), -1)[:, wetc])
-            if mx is not None:
-                mixf = dx2 * np.sum(mx[0] + mx[3])
-        out["mixing"] = mixf
-        menv, _ = self._mu_env()
-        out["exchange"] = -dx2 * np.sum(menv * (q.sum((1, 2)) + held.sum((1, 2))))
-        pore = 0.0
-        if self._has_pore:
-            C = self.ground.capacity
-            pore = dx2 * np.sum(-(c["P"] * held).sum(0) + c["Pb"] * C * pore_B(held.sum(0) / C))
-        out["sorption"] = pore
+        if "gravity" in terms:
+            out["gravity"] = dx2 * np.sum(gn * m * (zb + 0.5 * h) - m * (gxv * X[None, :] + gyv * Y))
+        if "capillary" in terms:
+            s = zb + h
+            cap = 0.0
+            for gam, a_, b_ in ((c["gx"], np.s_[:, 1:], np.s_[:, :-1]), (c["gy"], np.s_[1:, :], np.s_[:-1, :])):
+                dh, ds, dz = h[a_] - h[b_], s[a_] - s[b_], zb[a_] - zb[b_]
+                cap += np.sum(0.5 * gam * dh * (ds + dz))
+            out["capillary"] = cap
+        if "wetting" in terms:
+            out["wetting"] = dx2 * np.sum((-c["Sw"]) * (-np.expm1(-h / c["ell"]))) if self._has_wet else 0.0
+        if "mixing" in terms:
+            wetc = np.flatnonzero(h.ravel() > 0)
+            mixf = 0.0
+            if wetc.size:
+                mx = mixing(self._ctx_stub(), q.reshape(len(self.substances), -1)[:, wetc])
+                if mx is not None:
+                    mixf = dx2 * np.sum(mx[0] + mx[3])
+            out["mixing"] = mixf
+        if "exchange" in terms:
+            menv, _ = self._mu_env()
+            out["exchange"] = -dx2 * np.sum(menv * (q.sum((1, 2)) + held.sum((1, 2))))
+        if "sorption" in terms:
+            pore = 0.0
+            if self._has_pore:
+                C = self.ground.capacity
+                pore = dx2 * np.sum(-(c["P"] * held).sum(0) + c["Pb"] * C * pore_B(held.sum(0) / C))
+            out["sorption"] = pore
         return {k: float(v) for k, v in out.items()}
 
     def _ctx_stub(self):
@@ -286,12 +300,13 @@ class World:
         Fb0 = self.F()
         R = _union(self._window(window), self._dirty)
         acc = {k: 0.0 for k in MECHANISMS}
-        acc.update(num_time=0.0, num_transport=0.0, moved=0.0, pieces=0.0)
+        acc.update(num_time=0.0, num_transport=0.0, moved=0.0, pieces=0.0, num_local=0.0, drained=0.0, num_constraint=0.0)
         e = np.zeros(len(self.substances)); a = np.zeros(len(self.substances))
         rnd = 0.0
         relabel = 0.0
         dF = 0.0
         sl = 0.0
+        self._Fopen = None
         if R is not None:
             relabel, rnd = self._relabel(R, flags)
         Fb = self.F()
@@ -301,16 +316,31 @@ class World:
         ctxflags = []
         if R is not None and np.any(r > 0):
             self._saved = [R, self.q[_sl(R)].copy(), self.ground.held[_sl(R)].copy()]
-            for rep in self._advance(dt, r, window, 0, ctxflags):
+            try:
+                reps = self._advance(dt, r, window, 0, ctxflags)
+            except StepFailed:
+                R0, q0, h0 = self._saved                # undo every accepted piece: the step is all or nothing
+                self.q[_sl(R0)] = q0
+                self.ground.held[_sl(R0)] = h0
+                del self._saved
+                self._version += 1
+                raise
+            for rep in reps:
                 for k in MECHANISMS:
                     acc[k] += rep[k]
                 acc["num_time"] += rep["num_time"]; acc["num_transport"] += rep["num_transport"]
+                acc["num_local"] += rep["num_local"]; acc["drained"] += rep["drained"]
+                acc["num_constraint"] += rep["num_constraint"]
                 acc["moved"] += rep["moved"]
                 acc["pieces"] += 1
                 e += rep["e"]; a += rep["a"]
             R, q0, h0 = self._saved
             del self._saved
-            before, after = self._F_box(R, q=q0, held=h0), self._F_box(R)
+            op = getattr(self, "_Fopen", None)
+            before = dict(op[1]) if op is not None and op[0] == R else self._F_box(R, q=q0, held=h0)
+            after = self._F_box(R)
+            self._version += 1
+            self._Fcache = (R, self._version, after)
             for k in TERMS:
                 self._Ftot[k] += after[k] - before[k]
                 dF += after[k] - before[k]
@@ -346,7 +376,9 @@ class World:
             if dn < -1e-12 * max(acc["moved"], 1e-300):
                 flags.append(Flag("out_of_domain", "iterative solver",
                                   "D_num negative beyond rounding: its sign holds only to the solver's tolerance", dn))
-        report.update({"D_num time": float(acc["num_time"]), "D_num transport": float(acc["num_transport"]),
+        nwet = 0 if R is None else int(np.count_nonzero(self.q[_sl(R)].sum(0) > 0))     # the same in a window
+        report.update({"max energy floor": float(nwet * k_B * self.env.T), "D_num time": float(acc["num_time"]), "D_num transport": float(acc["num_transport"]),
+                       "D_num local": float(acc["num_local"]), "D_num constraint": float(acc["num_constraint"]), "drained cells": float(acc["drained"]),
                        "energy moved": float(acc["moved"]), "max slope": sl, "pieces": acc["pieces"],
                        "rate integral": float(dt * np.sum(r) * self.dx ** 2)})
         return Receipt("step", t0, self.t, self.matter.since(mm) + self.energy.since(me), res,
@@ -355,6 +387,8 @@ class World:
     ADVANCE_TOL = 1e-3          # D_num (time part) per step, as a share of the energy the step moved
     ADVANCE_DT0 = 1e-3          # s: the first step when the world has no step-size history
 
+    ADVANCE_MIN = 1e-9          # a rejected step shrinks fourfold; below this share of the duration advance stops
+
     def advance(self, duration, rate=None, solver=None, dt=None, tol=None):
         """Cover `duration` seconds of world time with as many steps as needed; return the summed Receipt.
 
@@ -362,39 +396,97 @@ class World:
         the time part of D_num is the Bregman divergence of the step, O(dt^2), so e = D_num time / energy moved
         is its error estimate. After a step with e <= tol/4 and no halving the next dt doubles; with e > tol it
         halves; a step that needed halvings is followed by dt / (its pieces). The last step lands on the end.
-        The size reached is kept for the next call."""
+        A step the world cannot take (StepFailed: it is left untouched) is retried at a quarter of its size; if that
+        falls below ADVANCE_MIN of the duration, advance stops where it is and returns what it did with a `solver`
+        flag (t1 of the receipt says how far it got). rate: as in step (a scalar or an [H, W] field). The size
+        reached is kept for the next call."""
         T = float(duration)
         if not T > 0:
             raise ValueError("duration must be positive")
         tol = self.ADVANCE_TOL if tol is None else float(tol)
         h = float(dt) if dt is not None else getattr(self, "_dt_next", self.ADVANCE_DT0)
+        t_start = self.t
         t_end = self.t + T
         total = None
-        nsteps = 0
+        nsteps, nfail = 0, 0
+        stopped = None
+        last, hold = getattr(self, "_adv_state", (None, None))
+        power = 0.0                                  # energy moved per second, averaged over the recent steps
+        priv = 0.0
         while self.t < t_end:
             left = t_end - self.t
             take = min(h, left)
-            if left - take < 1e-9 * take:            # do not leave a sliver
+            if left - take < 1e-6 * take:            # do not leave a sliver
                 take = left
-            r = self.step(take, rate=rate, solver=solver)
+            try:
+                r = self.step(take, rate=rate, solver=solver)
+            except StepFailed as exc:
+                nfail += 1
+                h = take / 4
+                if h < self.ADVANCE_MIN * T:
+                    stopped = (take, str(exc))
+                    break
+                continue
+            except RuntimeError as exc:                # not the world's own refusal: nothing says what it left behind
+                raise RuntimeError(f"advance: could not take a step of {take:.4g} s at t = {self.t:.6g} s: {exc}") from exc
             nsteps += 1
+            priv += sum(f.amount for f in r.flags if f.kind == "privilege" and f.subject == "painter")
             total = r if total is None else total + r
-            moved = r.report.get("energy moved", 0.0)
-            e = r.report.get("D_num time", 0.0) / moved if moved > 0 else 0.0
+            # the estimate is read against the energy the step moved, floored at k_B T per cell of its region (below
+            # that, D_num is rounding and says nothing about dt); only a full step (not the remainder that lands
+            # on the end) sets the next size
+            # (and against the power of the recent steps times this one's size: a step during which little happens
+            # is not held to a relative error on the little it moved)
+            mv = r.report.get("energy moved", 0.0)
+            moved = max(mv, r.report.get("max energy floor", 0.0), 0.5 * power * take)
+            power = mv / take if power == 0.0 else 0.5 * (power + mv / take)
+            # a cell drained dry is the local step's constraint: its share of D_num is O(1) in dt (a smaller dt only
+            # postpones the drain), so the local part is left out of the estimate when any cell drained
+            dn = r.report.get("D_num time", 0.0) - r.report.get("D_num constraint", 0.0)
+            if r.report.get("drained cells", 0.0) > 0:
+                dn -= r.report.get("D_num local", 0.0)
+            e = dn / moved if moved > 0 else 0.0
             pieces = r.report.get("pieces", 1.0) or 1.0
+            full = take >= h * (1 - 1e-9)
+            # A shrink that does not lower e by a quarter shows an error that is not the time step's (a constraint's
+            # reaction, a drained or saturated cell, whose share of D_num is O(1) in dt): the size goes back to the
+            # one before and is held there until e falls below tol/4.
             if pieces > 1:
-                h = take / pieces
-            elif e > tol:
-                h = take / 2
-            elif e <= tol / 4 and take == h:
+                h = min(h, take / pieces)
+            elif e > tol and full:
+                shrunk = last is not None and abs(last[0] - 2 * take) <= 1e-9 * take
+                if shrunk and e > 0.75 * last[1]:
+                    hold = 2 * take
+                    h = hold
+                elif hold is not None and take / 2 < hold * (1 - 1e-9):
+                    h = take
+                else:
+                    h = take / 2
+            elif e <= tol / 4 and full:
+                hold = None
                 h = 2 * h
+            if full:
+                last = (take, e)
             if self.t >= t_end or abs(self.t - t_end) <= 1e-12 * max(abs(t_end), 1.0):
                 self.t = t_end
                 break
         self._dt_next = h
+        self._adv_state = (last, hold)
+        # equal flags of equal steps would merge when receipts add: the clock's privilege is summed over every step
+        flags = () if total is None else tuple(f for f in total.flags if not (f.kind == "privilege" and f.subject == "painter"))
+        if priv:
+            flags = (Flag("privilege", "painter", f"clock rate != 1 in {nsteps} steps; amount: integral of r over cells and "
+                          "time, m^2 s", float(priv)),) + flags
+        if stopped is not None:
+            flags += (Flag("solver", "advance", f"stopped at t = {self.t:.6g} s of [{t_start:.6g}, {t_end:.6g}] s: a "
+                           f"step of {stopped[0]:.3g} s could not be accepted ({stopped[1]})", float(t_end - self.t)),)
+        if total is None:
+            return Receipt("advance", t_start, self.t, (), {"matter": 0.0, "energy": 0.0}, {}, flags,
+                           {"steps": 0.0, "rejected steps": float(nfail)})
         report = dict(total.report)
         report["steps"] = float(nsteps)
-        return Receipt("advance", total.t0, self.t, total.entries, total.residual, total.F, total.flags, report)
+        report["rejected steps"] = float(nfail)
+        return Receipt("advance", total.t0, self.t, total.entries, total.residual, total.F, flags, report)
 
     def _flags(self, pairs):
         seen, out = set(), []
@@ -406,10 +498,20 @@ class World:
     def _relabel(self, R, flags):
         """Re-evaluate the lagged coefficients on R; book the change of F at fixed state (DYNAMICS.md §2).
         Returns (the change, the magnitude of the F values it was computed from)."""
-        old = {k: v.copy() for k, v in self._lag_box(R).items()}
-        Fo = self._F_box(R)
+        # only the lagged terms change at fixed state; the others are the same numbers before and after (so their
+        # difference is exactly 0) and are read once, from the last step's closing evaluation if the state and the
+        # box are those it was computed on
+        Fo = self._F_box(R, terms=self.LAGGED_TERMS)
         self._store_coefficients(R, self._coefficients(R))
-        Fn = self._F_box(R)
+        cache = getattr(self, "_Fcache", None)
+        rest = tuple(k for k in TERMS if k not in self.LAGGED_TERMS)
+        if cache is not None and cache[0] == R and cache[1] == self._version:
+            Fn = {k: cache[2][k] for k in rest}
+        else:
+            Fn = self._F_box(R, terms=rest)
+        Fn.update(self._F_box(R, terms=self.LAGGED_TERMS))
+        Fo.update({k: Fn[k] for k in rest})
+        self._Fopen = (R, Fn)                     # F on R at the step's start, with the new coefficients
         d = 0.0
         for k in TERMS:
             self._Ftot[k] += Fn[k] - Fo[k]
@@ -423,9 +525,9 @@ class World:
     def _advance(self, dt, r, window, depth, ctxflags):
         try:
             return [self._piece(dt, r, window, ctxflags)]
-        except (Reject, SolveFailed):
+        except (Reject, SolveFailed, np.linalg.LinAlgError, FloatingPointError):
             if depth >= MAX_HALVINGS:
-                raise RuntimeError(f"step could not be accepted after {MAX_HALVINGS} halvings")
+                raise StepFailed(f"step could not be accepted after {MAX_HALVINGS} halvings")
             return self._advance(dt / 2, r, window, depth + 1, ctxflags) + self._advance(dt / 2, r, window, depth + 1, ctxflags)
 
     def _window(self, window):
@@ -443,7 +545,7 @@ class World:
     def _piece(self, dt, r, window, ctxflags):
         rep = {k: 0.0 for k in MECHANISMS}
         S = len(self.substances)
-        rep.update(num_time=0.0, num_transport=0.0, moved=0.0, e=np.zeros(S), a=np.zeros(S))
+        rep.update(num_time=0.0, num_transport=0.0, moved=0.0, e=np.zeros(S), a=np.zeros(S), num_local=0.0, drained=0.0, num_constraint=0.0)
         if not np.any(self.q):
             return rep
         win = self._window(window)
@@ -470,13 +572,15 @@ class World:
                   panel_faces(c["gx"], c["gy"], y0, y1, x0, x1), flat(c["Sw"]) if wetting else None,
                   flat(c["ell"]) if wetting else None, flat(c["P"]) if pores else None,
                   flat(c["Pb"]) if pores else None, self.ground.capacity, self.a, menv, has, flags,
-                  self._solver_now, {})
+                  self._solver_now, {}, [])
         q = flat(self.q).copy()
         held = flat(self.ground.held).copy()
         pst = ctx.stats
         q1, fr = flow(ctx, q, dt)
         q2, dr = diffuse(ctx, q1, dt)
         q3, held3, lr = local(ctx, q2, held, dt)
+        if not (np.all(np.isfinite(q3)) and np.all(np.isfinite(held3))):
+            raise Reject("non-finite state")
         # commit
         self.q[:, y0:y1, x0:x1] = q3.reshape(S, Hh, Ww)
         self.ground.held[:, y0:y1, x0:x1] = held3.reshape(S, Hh, Ww)
@@ -488,6 +592,9 @@ class World:
         rep["exchange"], rep["sorption"] = lr["D_exchange"], lr["D_sorption"]
         rep["num_time"] = ((-fr["dE"] - fr["D_viscous"] - fr["D_plastic"]) + (-dr["dF"] - dr["D_diffusion"])
                            + (-lr["dF"] - lr["D_exchange"] - lr["D_sorption"]))
+        rep["num_local"] = -lr["dF"] - lr["D_exchange"] - lr["D_sorption"]
+        rep["num_constraint"] = fr["D_constraint"] + fr["D_wetting"]
+        rep["drained"] = float(lr["drained"])
         rep["num_transport"] = -fr["dF_mix"]
         rep["moved"] = (abs(fr["dE"]) + abs(fr["dF_mix"]) + fr["D_viscous"] + fr["D_plastic"] + abs(dr["dF"])
                         + dr["D_diffusion"] + abs(lr["dF"]) + lr["D_exchange"] + lr["D_sorption"])
@@ -570,6 +677,7 @@ class World:
             return 0.0, 0.0
         before = self._F_box(box)
         act()
+        self._version += 1
         after = self._F_box(box)
         d = 0.0
         for k in TERMS:
@@ -610,16 +718,19 @@ class World:
         wet = self.q.sum(0) > 0
         box = self._box_of(wet)
         t = self.t
+        nwet = float(wet.sum())
         if box is None:
-            return Receipt("settle", t, t)
+            return Receipt("settle", t, t, report={"cells retired": 0.0, "cells still wet": 0.0})
         flags = []
         eta = call(self.con, "viscosity", Film(self.substances, self.q[_sl(box)]), flags=flags)
         stuck = np.zeros((self.H, self.W), bool)
         stuck[_sl(box)[1:]] = np.isposinf(np.asarray(eta, np.float64)) & wet[_sl(box)[1:]]
         if not stuck.any():
-            return Receipt("settle", t, t)
+            return Receipt("settle", t, t, report={"cells retired": 0.0, "cells still wet": nwet})
         r = self.retire(mask=stuck)
-        return Receipt("settle", r.t0, r.t1, r.entries, r.residual, r.F, r.flags + tuple(self._flags([])), r.report)
+        rep = dict(r.report)
+        rep.update({"cells retired": float(stuck.sum()), "cells still wet": nwet - float(stuck.sum())})
+        return Receipt("settle", r.t0, r.t1, r.entries, r.residual, r.F, r.flags + tuple(self._flags([])), rep)
 
     def set_environment(self, environment):
         """Change the reservoirs: an act whose ΔF is work by the environment's port. It changes F everywhere, so
@@ -628,6 +739,7 @@ class World:
         Fb = self.F(); sb = float(self.energy.balance("stored"))
         before = self._F_box(self._full)
         self.env = environment
+        self._version += 1
         after = self._F_box(self._full)
         d = 0.0
         for k in TERMS:

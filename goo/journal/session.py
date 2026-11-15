@@ -17,7 +17,7 @@ from goo.ports import Bench, make_ground, PortError
 from goo.substance import maps, library
 from goo.journal import acts as A
 from goo.journal.quantities import quantity
-from goo.journal.looking import look as _look, bands_of
+from goo.journal.looking import look as _look, bands_of, picture as _picture
 
 KEEP = 32            # forks kept in memory for back()
 
@@ -31,6 +31,29 @@ class Refused(ValueError):
 
 
 HESSIAN_FLOOR = 1e-250        # m: amounts below this are evaluated here for the mixing Hessian only (see Maps)
+
+
+DEDUP_MIN = 4096              # cells: below this, mixing is evaluated on every cell
+
+
+def _distinct(cols):
+    """(representatives, inverse) of the columns of cols [S, n] that are bit-identical, or None if grouping would not
+    halve the work. A 64-bit FNV-style hash per column, then an exact check of every column against its
+    representative: a collision makes this refuse, never merges different cells."""
+    a = np.ascontiguousarray(cols, np.float64).view(np.uint64)
+    h = np.full(a.shape[1], np.uint64(1469598103934665603))
+    prime = np.uint64(1099511628211)
+    with np.errstate(over="ignore"):
+        for row in a:
+            h ^= row
+            h *= prime
+    _, rep, inv = np.unique(h, return_index=True, return_inverse=True)
+    if rep.size > a.shape[1] // 2:
+        return None
+    inv = inv.ravel()
+    if not np.array_equal(a[:, rep[inv]], a):
+        return None
+    return rep, inv
 
 
 class Maps:
@@ -48,6 +71,25 @@ class Maps:
         return getattr(maps, name)
 
     def mixing(self, film, T=None):
+        """maps.mixing, evaluated once per distinct cell (exactly: a map is element-wise, SPEC §4.3; cells are
+        grouped by the bits of their amounts and every group is verified against its representative), then expanded.
+        mixing's map text and evidence carry no cell counts, so the answer is the one maps gives, bit for bit. A
+        flood lays the same composition on many cells, and mixing's Hessian is S x S per cell."""
+        q = np.asarray(film.q)
+        S, H, W = q.shape
+        groups = _distinct(q.reshape(S, H * W)) if H * W >= DEDUP_MIN else None
+        if groups is None:
+            return self._mixing(film, T)
+        rep, inv = groups
+        from goo.film import Film
+        sub = Film(film.substances, q.reshape(S, H * W)[:, rep][:, None, :], film.state)
+        out = self._mixing(sub, T)
+        from dataclasses import replace
+        expand = lambda a: np.asarray(a)[..., 0, :][..., inv].reshape(np.shape(a)[:-2] + (H, W))
+        v = out.value
+        return replace(out, value=type(v)(*(expand(a) for a in v)))
+
+    def _mixing(self, film, T=None):
         out = maps.mixing(film, T)
         q = np.asarray(film.q)
         tiny = (q > 0) & (q < HESSIAN_FLOOR)
@@ -145,6 +187,11 @@ def summary(rec, wall=None):
               "cells still wet"):
         if k in rec.report:
             parts.append(f"{k} {rec.report[k]:.4g}")
+    vol = {k[len("volatile retired kg "):]: v for k, v in rec.report.items() if k.startswith("volatile retired kg ")}
+    if vol:
+        parts.append("FROZE WET FILM: this settle retired film still holding volatile liquid ("
+                     + ", ".join(f"{k} {v:.3g} kg" for k, v in vol.items())
+                     + ") into a stratum; it stays there and will not evaporate")
     if rec.report.get("shortfall m^3"):
         parts.append("VESSEL RAN DRY")
     if wall is not None:
@@ -156,12 +203,17 @@ class Session:
     """A painting in progress. `do(act)` with an act's JSON (or a list, done all or nothing); `look(...)`;
     `back(n)`; `fork()` for rehearsal; `entries` the journal; `replay(entries, initial)` reproduces it."""
 
-    def __init__(self, initial):
+    def __init__(self, initial, keep=KEEP, atomic=True):
+        """keep: forks kept in memory for back() (0: none). atomic: each act is done on a fork and kept only if it
+        succeeds; with atomic=False (the command line, which saves only on success) an act is done in place, which
+        spares a copy of every panel array, and a failed act leaves the session unusable (Refused, then any
+        further use raises)."""
         self._initial = normalise_initial(initial)
         self._bench = build(self._initial)
         self._bandset = _bands(self._initial)
         self._entries = []
-        self._kept = {0: self._bench.fork()}
+        self._keep, self._atomic, self._broken = int(keep), bool(atomic), None
+        self._kept = {0: self._bench.fork()} if self._keep else {}
 
     # ---- what a painter may know -------------------------------------------------------------------------
     @property
@@ -200,8 +252,10 @@ class Session:
     def do(self, act):
         """Do an act (a JSON object) or a list of acts (all or nothing). Returns the receipt (or a list of them).
         Raises Refused, with the reason, if any act cannot be done; then nothing has changed."""
+        if self._broken:
+            raise Refused(f"this session is unusable after a failed act done in place ({self._broken}); reload it")
         acts = act if isinstance(act, list) else [act]
-        bench = self._bench.fork()
+        bench = self._bench.fork() if self._atomic else self._bench
         new, kept, recs = [], [], []
         for a in acts:
             a = json.loads(json.dumps(a))                 # JSON only: what the journal can hold
@@ -211,18 +265,22 @@ class Session:
             try:
                 rec = A.run(bench, a)
             except (ValueError, RuntimeError) as e:
-                raise Refused(f"{a.get('act', '?') if isinstance(a, dict) else '?'}: {e}") from None
+                why = f"{a.get('act', '?') if isinstance(a, dict) else '?'}: {e}"
+                if not self._atomic:
+                    self._broken = why
+                raise Refused(why) from None
             wall = time.perf_counter() - t
             n = len(self._entries) + len(new) + 1
             entry = dict(n=n, act=a["act"], params={k: v for k, v in a.items() if k != "act"}, seed=a.get("seed"),
                          clock=[rec.t0, rec.t1], receipt=rec.digest(), world=bench.world.digest(),
                          summary=summary(rec, wall), wall=wall)
-            new.append(entry); recs.append(rec); kept.append(bench.fork())
+            new.append(entry); recs.append(rec); kept.append(bench.fork() if self._keep else None)
         self._bench = bench
         for e, k in zip(new, kept):
             self._entries.append(e)
-            self._kept[e["n"]] = k
-        for n in sorted(self._kept)[:-KEEP]:
+            if k is not None:
+                self._kept[e["n"]] = k
+        for n in sorted(self._kept)[:-self._keep or None]:
             if n != 0:
                 del self._kept[n]
         return recs if isinstance(act, list) else recs[0]
@@ -239,6 +297,14 @@ class Session:
         asked. Changes nothing."""
         return _look(self._bench.world, self._bandset, light, exposure, region, gloss, infrared)
 
+    def picture(self, light="daylight", exposure=1.0, region=None, scale=1, gloss=False, infrared=False, cache=None):
+        """A picture (goo.journal.looking.Picture) at an integer scale or a fraction 1/k (k x k cells averaged in
+        linear light), reusing the optics of cells unchanged since the last picture (`cache`: a dict, kept by the
+        caller; default one held by this session in memory). Changes nothing."""
+        if cache is None:
+            cache = self.__dict__.setdefault("_pcache", {})
+        return _picture(self._bench.world, self._bandset, cache, light, exposure, region, scale, gloss, infrared)
+
     # ---- time travel and rehearsal -----------------------------------------------------------------------
     def back(self, n=1):
         """Return to the state after entry len(entries) - n (by a kept fork if there is one, else by replay)."""
@@ -251,7 +317,7 @@ class Session:
         if k in self._kept:
             self._bench = self._kept[k].fork()
         else:
-            self._bench = replay(self._entries[:k], self._initial)._bench
+            self._bench = replay(self._entries[:k], self._initial, keep=0)._bench
         self._entries = self._entries[:k]
         for j in [j for j in self._kept if j > k]:
             del self._kept[j]
@@ -264,6 +330,7 @@ class Session:
         new._bandset = self._bandset
         new._entries = copy.deepcopy(self._entries)
         new._kept = dict(self._kept)
+        new._keep, new._atomic, new._broken = self._keep, True, None
         return new
 
     # ---- persistence --------------------------------------------------------------------------------------
@@ -271,18 +338,37 @@ class Session:
         return dict(initial=self.initial, entries=self.entries)
 
     def __getstate__(self):
-        return dict(_initial=self._initial, _bench=self._bench, _entries=self._entries, _kept={})
+        return dict(_initial=self._initial, _bench=self._bench, _entries=self._entries, _kept={},
+                    _keep=self._keep, _atomic=self._atomic, _broken=None)
 
     def __setstate__(self, d):
+        d.setdefault("_keep", KEEP); d.setdefault("_atomic", True); d.setdefault("_broken", None)
         self.__dict__.update(d)
         self._bandset = _bands(self._initial)
         self._kept = {}
 
+    def configure(self, keep=None, atomic=None):
+        if keep is not None:
+            self._keep = int(keep)
+            if not self._keep:
+                self._kept = {}
+        if atomic is not None:
+            self._atomic = bool(atomic)
 
-def replay(entries, initial, check=True):
+    def resume(self, entries):
+        """Do the journal's `entries` after this session's own, checking every digest (replay from a checkpoint)."""
+        for e in entries:
+            self.do(dict(act=e["act"], **e["params"]))
+            got = self._entries[-1]
+            if got["receipt"] != e["receipt"] or got["world"] != e["world"]:
+                raise ReplayError(f"entry {e['n']} ({e['act']}): replay differs from the journal")
+        return self
+
+
+def replay(entries, initial, check=True, **session):
     """A session rebuilt from the initial description by doing each entry's act again. With check, every receipt's
-    digest and the world's digest after every entry must equal the journal's, bit for bit."""
-    s = Session(initial)
+    digest and the world's digest after every entry must equal the journal's, bit for bit. `session`: keep, atomic."""
+    s = Session(initial, **session)
     for e in entries:
         s.do(dict(act=e["act"], **e["params"]))
         got = s._entries[-1]

@@ -6,19 +6,21 @@
     python -m goo.journal DIR log | back N | fork NAME | use NAME | branches | vessels | vocab | replay
 
 State lives in DIR: DIR/current names the branch; DIR/branches/NAME/journal.json is the journal (portable JSON,
-the truth); DIR/branches/NAME/state.pkl and ckpt/NNNN.pkl are pickles of the session after the last entry and
-after each entry (a cache: not portable across goo or numpy versions; replay rebuilds them from the journal).
+the truth); DIR/branches/NAME/state.pkz is the session after the last entry, and ckpt/NNNN.pkz checkpoints at entry
+0, every CKPT_EVERY entries (the CKPT_RECENT newest kept) and on request (`checkpoint`, never thinned). They are
+compressed pickles (goo.journal.store): a cache, not portable across goo or numpy versions; `back` loads the nearest
+checkpoint and replays the journal from it, and `replay` rebuilds everything from the journal.
 This module uses only the Session's public interface."""
 import argparse
 import json
 import pathlib
-import pickle
 import shutil
 import sys
 import time
 from goo.journal.session import Session, Refused, replay, ReplayError
 from goo.journal import acts as A
-from goo.journal.looking import write_png
+from goo.journal.looking import write_png, load_cache, save_cache
+from goo.journal import store
 
 
 def _paths(d, branch=None):
@@ -32,29 +34,63 @@ def _paths(d, branch=None):
     return d, b, branch
 
 
-def _save(bdir, s):
+CKPT_EVERY = 10          # a checkpoint every this many entries
+CKPT_RECENT = 3          # periodic checkpoints kept besides entry 0 and those asked for
+
+
+def _ckpts(bdir):
+    """{entry number: path} of the checkpoints on disk."""
+    out = {}
+    for p in (bdir / "ckpt").glob("*.pkz"):
+        out[int(p.name.split(".")[0])] = p
+    return out
+
+
+def _save(bdir, s, checkpoint=False):
+    """Write the journal and the session (compressed: goo.journal.store); write a checkpoint at entry 0, every
+    CKPT_EVERY entries and when asked, and thin the periodic ones to the CKPT_RECENT newest."""
     bdir.mkdir(parents=True, exist_ok=True)
     (bdir / "ckpt").mkdir(exist_ok=True)
     j = s.journal()
     tmp = bdir / "journal.json.tmp"
     tmp.write_text(json.dumps(j, indent=1))
     tmp.replace(bdir / "journal.json")
-    with open(bdir / "state.pkl.tmp", "wb") as f:
-        pickle.dump(s, f, protocol=pickle.HIGHEST_PROTOCOL)
-    (bdir / "state.pkl.tmp").replace(bdir / "state.pkl")
-    shutil.copyfile(bdir / "state.pkl", bdir / "ckpt" / f"{len(j['entries']):04d}.pkl")
+    blob = store.dumps(s)
+    (bdir / "state.pkz.tmp").write_bytes(blob)
+    (bdir / "state.pkz.tmp").replace(bdir / "state.pkz")
+    n = len(j["entries"])
+    if checkpoint or n == 0 or n % CKPT_EVERY == 0:
+        name = f"{n:04d}.keep.pkz" if checkpoint else f"{n:04d}.pkz"
+        (bdir / "ckpt" / name).write_bytes(blob)
+    periodic = sorted(k for k, p in _ckpts(bdir).items() if k > 0 and ".keep." not in p.name)
+    for k in periodic[:-CKPT_RECENT]:
+        _ckpts(bdir)[k].unlink()
 
 
 def _load(bdir):
     j = json.loads((bdir / "journal.json").read_text())
-    p = bdir / "state.pkl"
+    p = bdir / "state.pkz"
     if p.exists():
-        with open(p, "rb") as f:
-            s = pickle.load(f)
-        if s.entries and s.digest() != j["entries"][-1]["world"]:
-            raise SystemExit("state.pkl does not match the journal; run 'replay'")
+        s = store.load(p)
+        es = s.entries
+        if len(es) != len(j["entries"]) or (es and es[-1]["world"] != j["entries"][-1]["world"]):
+            raise SystemExit("state.pkz does not match the journal; run 'replay'")
+        s.configure(keep=0, atomic=False)
         return s, j
-    return replay(j["entries"], j["initial"]), j
+    return replay(j["entries"], j["initial"], keep=0, atomic=False), j
+
+
+def _back(bdir, j, k):
+    """The session after entry k: the newest checkpoint at or before k, then the journal's entries replayed."""
+    cks = {n: p for n, p in _ckpts(bdir).items() if n <= k}
+    if cks:
+        s = store.load(cks[max(cks)])
+        s.configure(keep=0, atomic=False)
+        if s.entries != j["entries"][:len(s.entries)]:
+            cks = {}
+    if not cks:
+        s = Session(j["initial"], keep=0, atomic=False)
+    return s.resume(j["entries"][len(s.entries):k])
 
 
 def _size(t):
@@ -82,13 +118,14 @@ def main(argv=None):
     d.add_argument("act")
     lk = sub.add_parser("look", help="write a PNG of what the painting shows and print its path")
     lk.add_argument("--region", default=None, help="a region as JSON (its bounding box is shown)")
-    lk.add_argument("--scale", type=int, default=1); lk.add_argument("--exposure", type=float, default=1.0)
+    lk.add_argument("--scale", type=float, default=1, help="integer, or a fraction 1/k (0.5, 0.25): k x k cells averaged in linear light"); lk.add_argument("--exposure", type=float, default=1.0)
     lk.add_argument("--gloss", action="store_true"); lk.add_argument("--ir", action="store_true")
     lk.add_argument("--light", default="daylight"); lk.add_argument("--name", default=None)
     sub.add_parser("log", help="the journal, one line an entry")
     bk = sub.add_parser("back", help="undo the last N acts"); bk.add_argument("n", type=int)
     fk = sub.add_parser("fork", help="copy this branch to NAME (stay on this one)"); fk.add_argument("name")
     us = sub.add_parser("use", help="switch to branch NAME"); us.add_argument("name")
+    sub.add_parser("checkpoint", help="keep a checkpoint of the current state (never thinned)")
     sub.add_parser("branches"); sub.add_parser("vessels"); sub.add_parser("vocab"); sub.add_parser("replay")
     a = ap.parse_args(argv)
 
@@ -105,7 +142,7 @@ def main(argv=None):
         init = dict(size=a.size, dx=a.dx, ground=g, substances=a.substances.split(","),
                     air={"humidity": a.humidity, "temperature": a.temperature}, seed=a.seed)
         try:
-            s = Session(init)
+            s = Session(init, keep=0, atomic=False)
         except ValueError as e:
             raise SystemExit(f"refused: {e}")
         root.mkdir(parents=True, exist_ok=True)
@@ -159,23 +196,31 @@ def main(argv=None):
         return 0
     if a.cmd == "look":
         region = json.loads(a.region) if a.region else None
+        cpath = bdir / "lookcache.npz"
+        cache = load_cache(cpath) if cpath.exists() else {}
         try:
-            seen = s.look(light=a.light, exposure=a.exposure, region=region, gloss=a.gloss, infrared=a.ir)
+            pic = s.picture(light=a.light, exposure=a.exposure, region=region, scale=a.scale, gloss=a.gloss,
+                            infrared=a.ir, cache=cache)
         except ValueError as e:
             print(f"refused: {e}"); return 1
+        tl = time.perf_counter()
+        save_cache(cache, cpath)
         out = root / "looks"
         out.mkdir(exist_ok=True)
         tag = a.name or f"{branch}-{len(s.entries):04d}"
-        paths = [write_png(seen.image, out / f"{tag}.png", a.scale)]
+        paths = [write_png(pic.image, out / f"{tag}.png")]
         if a.gloss:
-            paths.append(write_png(seen.gloss_image, out / f"{tag}-gloss.png", a.scale))
+            paths.append(write_png(pic.gloss_image, out / f"{tag}-gloss.png"))
         if a.ir:
-            paths.append(write_png(seen.infrared_image, out / f"{tag}-ir.png", a.scale))
-        fl = sorted({f.kind for f in seen.receipt.flags})
+            paths.append(write_png(pic.infrared_image, out / f"{tag}-ir.png"))
+        fl = sorted({f.kind for f in pic.receipt.flags}) if pic.receipt else []
         print("\n".join(paths))
-        print(f"look at t {s.time:.6g} s, light {seen.light}, exposure {seen.exposure:g}, box {seen.box}, "
-              f"light residual {seen.receipt.residual['light']:.1e}, flags {', '.join(fl) or 'none'}; "
-              f"{time.perf_counter() - t:.2f} s")
+        print(f"look at t {s.time:.6g} s, light {pic.light}, exposure {pic.exposure:g}, scale {pic.scale:g}, box "
+              f"{pic.box}, image {pic.image.shape[1]} x {pic.image.shape[0]}; optics solved for {pic.solved} of "
+              f"{pic.cells} cells (the rest reused)"
+              + (f", light residual {pic.receipt.residual['light']:.1e}, flags {', '.join(fl) or 'none'}"
+                 if pic.receipt else "")
+              + f"; {time.perf_counter() - t:.2f} s (cache save {time.perf_counter() - tl:.2f} s)")
         return 0
     if a.cmd == "log":
         print("\n".join(s.log()) or "(no acts yet)")
@@ -188,24 +233,23 @@ def main(argv=None):
             print(f"tape {k}: {'on' if on else 'peeled'}, caught {kg:.3g} kg")
         return 0
     if a.cmd == "back":
-        ck = bdir / "ckpt" / f"{len(s.entries) - a.n:04d}.pkl"
-        if 0 <= len(s.entries) - a.n < len(s.entries) and ck.exists():
-            with open(ck, "rb") as f:
-                s = pickle.load(f)
-        else:
-            try:
-                s.back(a.n)
-            except Refused as e:
-                print(f"refused: {e}"); return 1
-        for old in (bdir / "ckpt").glob("*.pkl"):
-            if int(old.stem) > len(s.entries):
-                old.unlink()
+        k = len(s.entries) - a.n
+        if not 0 <= k <= len(s.entries):
+            print(f"refused: back 0 to {len(s.entries)}"); return 1
+        s = _back(bdir, j, k)
+        for n, p in _ckpts(bdir).items():
+            if n > k:
+                p.unlink()
         _save(bdir, s)
-        print(f"back to entry {len(s.entries)}, world time {s.time:.6g} s")
+        print(f"back to entry {len(s.entries)}, world time {s.time:.6g} s; {time.perf_counter() - t:.2f} s")
+        return 0
+    if a.cmd == "checkpoint":
+        _save(bdir, s, checkpoint=True)
+        print(f"checkpoint kept at entry {len(s.entries)}")
         return 0
     if a.cmd == "replay":
         try:
-            r = replay(j["entries"], j["initial"])
+            r = replay(j["entries"], j["initial"], keep=0, atomic=False)
         except ReplayError as e:
             print(f"REPLAY DIFFERS: {e}"); return 1
         _save(bdir, r)

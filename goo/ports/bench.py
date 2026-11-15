@@ -139,10 +139,23 @@ class Bench:
         return out
 
     def closure(self):
-        """Matter closure of the whole bench: max over accounts of |ledger - state| / total mass held."""
-        st = self.state_mass()
-        scale = float(sum(np.sum(v) for v in st.values())) or 1.0
-        return max(float(np.max(np.abs(self.world.matter.balance(k) - v))) for k, v in st.items()) / scale
+        """Matter closure of the bench's own accounts (every vessel and tape, overspray and spill) against their
+        state: max |ledger - state| over the mass the ledger says the world and bodies hold. The world's accounts
+        (wet, ground, strata) are closed by the world's own receipts, which every act that touches them carries.
+        Cost O(accounts x substances), whatever the panel."""
+        L = self.world.matter
+        st = {}
+        for v in self.vessels.values():
+            st[v.account] = v.mass
+        for t in self.tapes.values():
+            st[t.account] = t.mass
+        for k, m in self.reservoirs.items():
+            st[f"reservoir[{k}]"] = m
+        scale = float(np.sum(L.balance("wet")) + np.sum(L.balance("ground")) + np.sum(L.held("stratum["))
+                      + sum(np.sum(v) for v in st.values())) or 1.0
+        if not st:
+            return 0.0
+        return max(float(np.max(np.abs(L.balance(k) - v))) for k, v in st.items()) / scale
 
     # ---- clocks -------------------------------------------------------------------------------------------
     def rate_field(self, rate=1.0, where=None):
@@ -184,6 +197,15 @@ class Bench:
             return
         self._clock_flags(ctx, r)
         w = self.world
+        if r is not None and not np.any(r):
+            # every cell held: a step at rate 0 returns the state bit for bit and only moves the clock (O4,
+            # DYNAMICS.md §7), so the bench moves the clock itself and spares a panel-sized step
+            w.t = w.t + duration
+            ctx["report"]["held seconds"] = ctx["report"].get("held seconds", 0.0) + duration
+            if not any(f.kind == "privilege" and f.subject == "painter" for f in ctx["flags"]):
+                ctx["flags"].append(Flag("privilege", "painter", "every cell held: the clock moved, nothing else; "
+                                         "amount: integral of r over cells and time, m^2 s", 0.0))
+            return
         adv = getattr(w, "advance", None)
         if adv is not None:
             kw = {}
@@ -192,12 +214,11 @@ class Bench:
                 kw["rate"] = r
             elif r is not None:
                 raise PortError("World.advance takes no rate: holds and tapes cannot be honoured")
-            f = w.fork()
             try:
-                out = f.advance(duration, **kw)
+                out = w.advance(duration, **kw)
             except RuntimeError as e:
+                # the world may have taken part of the duration: a Bench act is not atomic; a Session's is
                 raise PortError(f"the world could not advance {duration:.4g} s: {e}") from None
-            self.world = f
             ctx["parts"].extend(out if isinstance(out, (list, tuple)) else [out])
             ctx["report"]["stepper"] = 1.0
             return
@@ -322,10 +343,11 @@ class Bench:
         L = G.length(pts)
         return max(int(min_pieces), int(np.ceil(L / max(radius_cells, 0.5))), 1), L
 
-    def pour(self, vessel, path, volume, duration, width, min_pieces=4, units="cells"):
+    def pour(self, vessel, path, volume, duration, width, min_pieces=4, units="cells", edge=0.0):
         """A spout moving along `path` at constant speed for `duration` s, laying `volume` m^3 at a constant flow
-        rate through a round footprint of diameter `width` m. Resolved in pieces: the spout moves at most half its
-        footprint per piece (at least `min_pieces`); each piece lays its share, then the world runs for its time."""
+        rate through a round footprint of diameter `width` m, tapered over `edge` m inside its rim (0: flat).
+        Resolved in pieces: the spout moves at most half its footprint per piece (at least `min_pieces`); each piece
+        lays its share, then the world runs for its time."""
         v = self._vessel(vessel)
         pts = self.path(path, units)
         if not (volume > 0 and width > 0 and duration >= 0):
@@ -337,15 +359,22 @@ class Bench:
         s = np.linspace(0.0, L, n + 1)
         ends = G.along(pts, s)
         for k in range(n):
-            wts, off = G.footprint(ends[k], ends[k + 1], r, self.H, self.W)
+            wts, off = G.footprint(ends[k], ends[k + 1], r, self.H, self.W, self._edge(edge))
             self._deposit(ctx, v, volume / n, wts, off, "spill")
             self._run(ctx, duration / n, rate)
         ctx["report"]["pieces laid"] = float(n)
         return self._close("pour", ctx)
 
-    def flood(self, vessel, region, thickness, duration=0.0, pieces=1, units="cells"):
-        """An even film of `thickness` m over a region: a pour whose spout covers the region, in `pieces` equal
-        parts over `duration` s."""
+    def _edge(self, edge):
+        edge = float(edge or 0.0)
+        if not (np.isfinite(edge) and edge >= 0):
+            raise PortError("edge: a length >= 0")
+        return edge / self.dx
+
+    def flood(self, vessel, region, thickness, duration=0.0, pieces=1, units="cells", edge=0.0):
+        """A film of `thickness` m over a region: a pour whose spout covers the region, in `pieces` equal parts
+        over `duration` s. With `edge` > 0 m the thickness falls linearly to 0 over that distance inside the
+        region's boundary (distance from a cell's centre to the nearest cell outside, less half a cell)."""
         v = self._vessel(vessel)
         mask = self.region(region, units)
         n = int(mask.sum())
@@ -355,8 +384,15 @@ class Bench:
             raise PortError("flood: thickness > 0, duration >= 0, pieces >= 1")
         ctx = self._open()
         rate = self.rate_field()
-        V = thickness * n * self.dx ** 2
-        wts = mask / n
+        e = self._edge(edge)
+        if e > 0:
+            from scipy.ndimage import distance_transform_edt
+            d = distance_transform_edt(np.pad(mask, 1))[1:-1, 1:-1] - 0.5
+            shape = np.where(mask, G.taper(d, e), 0.0)
+        else:
+            shape = mask.astype(float)
+        V = thickness * float(shape.sum()) * self.dx ** 2
+        wts = shape / shape.sum()
         k = int(pieces)
         for _ in range(k):
             self._deposit(ctx, v, V / k, wts, 0.0, "spill")
@@ -398,11 +434,14 @@ class Bench:
 
     MAX_DROPLETS = 20_000_000
 
-    def spray(self, vessel, path, flow, duration, cone_radius, droplet_size, seed, min_pieces=4, units="cells"):
+    def spray(self, vessel, path, flow, duration, cone_radius, droplet_size, seed, min_pieces=4, units="cells",
+              edge=0.0):
         """A spray gun moving along `path` for `duration` s at `flow` m^3/s. Droplets of diameter `droplet_size` m
         (monodisperse; their number is the volume over one droplet's, rounded, each carrying an equal share) leave the
         nozzle at times uniform over the act and land uniformly in a disc of `cone_radius` m around the nozzle's
-        point. Positions come from numpy's default_rng(seed). A droplet lands in the cell holding its centre;
+        point; with `edge` > 0 m the landing density falls linearly to 0 over that distance inside the cone's rim
+        (radii drawn by the inverse of that distribution's tabulated CDF). Positions come from numpy's
+        default_rng(seed). A droplet lands in the cell holding its centre;
         one whose centre is off the panel is overspray, booked to reservoir[overspray]. Not modelled: evaporation in
         flight (flash-off), impact, splash and bounce, drift, a droplet's spread over more than one cell."""
         v = self._vessel(vessel)
@@ -417,6 +456,15 @@ class Bench:
         if N > self.MAX_DROPLETS:
             raise PortError(f"spray: {N} droplets (more than {self.MAX_DROPLETS}); use larger droplets or less paint")
         R = cone_radius / self.dx
+        e = self._edge(edge)
+        if e > 0:
+            rg = np.linspace(0.0, R, 4097)
+            pdf = rg * G.taper(R - rg, e)
+            cdf = np.concatenate([[0.0], np.cumsum(0.5 * (pdf[1:] + pdf[:-1]))])
+            cdf /= cdf[-1]
+            radius = lambda u: np.interp(u, cdf, rg)
+        else:
+            radius = lambda u: R * np.sqrt(u)
         n, L = self._pieces(pts, R, min_pieces)
         rng = np.random.default_rng(int(seed))
         counts = np.diff(np.round(np.linspace(0, N, n + 1)).astype(np.int64))
@@ -429,7 +477,7 @@ class Bench:
             if c:
                 u = rng.random((c, 3))
                 centre = G.along(pts, s[k] + (s[k + 1] - s[k]) * u[:, 0])
-                rad = R * np.sqrt(u[:, 1])
+                rad = radius(u[:, 1])
                 ang = 2 * np.pi * u[:, 2]
                 x = centre[:, 0] + rad * np.cos(ang)
                 y = centre[:, 1] + rad * np.sin(ang)
@@ -547,7 +595,7 @@ class Bench:
         return self._close("release", ctx)
 
     # ---- settle -------------------------------------------------------------------------------------------
-    def can_flow(self, horizon, length):
+    def can_flow(self, horizon, length, within=None):
         """Where the wet film could still flow appreciably within `horizon` s over a lateral scale `length` m:
         a Look-free rule from the state and the constitutive maps (used only when the world has no settle).
 
@@ -556,14 +604,20 @@ class Bench:
                            h (rho |g_t| + (rho g_n + gamma k^2) h k)
 
         The first bracket is the levelling of a ripple of wavelength `length` under gravity and capillarity, the
-        second the drainage of a film down a tilt over `length`."""
+        second the drainage of a film down a tilt over `length`. The maps are evaluated only on the bounding box of
+        the wet cells (within `within`, a mask, if given); the answer is panel-shaped."""
         w = self.world
-        film = Film(w.substances, w.q)
+        wet_all = w.q.sum(0) > 0
+        if within is not None:
+            wet_all &= within
+        full = np.zeros_like(wet_all)
+        if not wet_all.any():
+            return full
+        rows, cols = np.flatnonzero(wet_all.any(1)), np.flatnonzero(wet_all.any(0))
+        sl = np.s_[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
+        film = Film(w.substances, w.q[(slice(None),) + sl])
         h = film.h
-        wet = h > 0
-        out = np.zeros_like(wet)
-        if not wet.any():
-            return out
+        wet = wet_all[sl]
         flags = []
         eta = np.asarray(call(w.con, "viscosity", film, flags=flags), float)
         gam = call(w.con, "surface_tension", film, flags=flags)
@@ -578,8 +632,8 @@ class Bench:
             mob = np.where(np.isfinite(eta) & (eta > 0), h ** 3 / (3 * eta), 0.0)
             rate = mob * ((rho * gn + gam * k * k) * k * k + np.where(h > 0, rho * gt / (h * length), 0.0))
             drive = h * (rho * gt + (rho * gn + gam * k * k) * h * k)
-        out = wet & (rate * horizon >= 1.0) & ~(ty >= drive)
-        return out
+        full[sl] = wet & (rate * horizon >= 1.0) & ~(ty >= drive)
+        return full
 
     def settle(self, where="all", horizon=86400.0, length=1e-3, force=False, units="cells"):
         """Turn the wet film that can no longer flow into a stratum. With World.settle, the world decides; otherwise
@@ -593,9 +647,12 @@ class Bench:
         if ws is not None and not force and where == "all":
             out = ws()
             ctx["parts"].extend(out if isinstance(out, (list, tuple)) else [out])
+            still = w.q.sum(0) > 0
+            ctx["report"]["cells retired"] = float((wet & ~still).sum())
+            ctx["report"]["cells still wet"] = float(still.sum())
             ctx["report"]["rule"] = 1.0
             return self._close("settle", ctx)
-        fl = self.can_flow(horizon, length)
+        fl = self.can_flow(horizon, length, within=mask)
         sel = mask & wet & (np.ones_like(wet) if force else ~fl)
         liquid = int(np.count_nonzero(sel & fl))
         if liquid:
@@ -605,6 +662,14 @@ class Bench:
         ctx["report"]["cells still wet"] = float((wet & ~sel).sum())
         ctx["report"]["rule"] = 0.0
         if sel.any():
+            vol = np.array([s.volatile for s in self.subs])
+            if vol.any():
+                rows, cols = np.flatnonzero(sel.any(1)), np.flatnonzero(sel.any(0))
+                b = np.s_[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
+                kg = self.rho[vol] * np.where(sel[b], w.q[vol][(slice(None),) + b], 0.0).sum((1, 2)) * self.dx ** 2
+                for name, m in zip(np.array(self.names)[vol], kg):
+                    if m > 0:
+                        ctx["report"][f"volatile retired kg {name}"] = float(m)
             ctx["parts"].append(w.retire(mask=sel))
         return self._close("settle", ctx)
 

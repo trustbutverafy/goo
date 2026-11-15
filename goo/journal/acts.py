@@ -76,18 +76,19 @@ def _fill(b, p):
 @act("pour", {"act": "pour", "vessel": "cup", "path": [[10, 10], [60, 20]], "volume": "2 uL", "duration": "4 s",
               "width": "2 mm"},
      vessel=("str", REQ), path=("path", REQ), volume=("volume", REQ), duration=("time", REQ), width=("length", REQ),
-     min_pieces=("int", 4))
+     min_pieces=("int", 4), edge=("length", 0.0))
 def _pour(b, p):
-    """A spout along a path (or at a point) for a duration, at constant flow, footprint diameter `width`."""
-    return b.pour(p["vessel"], p["path"], p["volume"], p["duration"], p["width"], p["min_pieces"])
+    """A spout along a path (or at a point) for a duration, at constant flow, footprint diameter `width`, its edge
+    tapered over `edge` (default 0: flat)."""
+    return b.pour(p["vessel"], p["path"], p["volume"], p["duration"], p["width"], p["min_pieces"], edge=p["edge"])
 
 
 @act("flood", {"act": "flood", "vessel": "cup", "region": "all", "thickness": "20 um"},
      vessel=("str", REQ), region=("region", REQ), thickness=("length", REQ), duration=("time", 0.0),
-     pieces=("int", 1))
+     pieces=("int", 1), edge=("length", 0.0))
 def _flood(b, p):
-    """An even film of a thickness over a region (a pour whose spout covers it)."""
-    return b.flood(p["vessel"], p["region"], p["thickness"], p["duration"], p["pieces"])
+    """An even film of a thickness over a region (a pour whose spout covers it), its edge tapered over `edge`."""
+    return b.flood(p["vessel"], p["region"], p["thickness"], p["duration"], p["pieces"], edge=p["edge"])
 
 
 @act("drop", {"act": "drop", "vessel": "cup", "at": [30, 20], "volume": "0.5 uL"},
@@ -109,11 +110,12 @@ def _drip(b, p):
 @act("spray", {"act": "spray", "vessel": "cup", "path": [[5, 5], [60, 5]], "flow": "0.5 uL/s", "duration": "2 s",
                "cone_radius": "1.5 mm", "droplet_size": "60 um", "seed": 1},
      vessel=("str", REQ), path=("path", REQ), flow=("flow", REQ), duration=("time", REQ), cone_radius=("length", REQ),
-     droplet_size=("length", REQ), seed=("int", None), min_pieces=("int", 4))
+     droplet_size=("length", REQ), seed=("int", None), min_pieces=("int", 4), edge=("length", 0.0))
 def _spray(b, p):
-    """Droplets from a seeded generator through a cone; what misses the panel is reservoir[overspray]."""
+    """Droplets from a seeded generator through a cone (its rim tapered over `edge`); what misses the panel is
+    reservoir[overspray]."""
     return b.spray(p["vessel"], p["path"], p["flow"], p["duration"], p["cone_radius"], p["droplet_size"], p["seed"],
-                   p["min_pieces"])
+                   p["min_pieces"], edge=p["edge"])
 
 
 @act("tape", {"act": "tape", "name": "edge", "region": {"rect": [0, 0, 64, 6]}}, name=("str", REQ),

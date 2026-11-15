@@ -32,7 +32,7 @@ def flow(ctx, q, dt):
     m = ctx.rho @ q
     wet = h > 0
     rep = dict(D_viscous=0.0, D_plastic=0.0, dE=0.0, dF_mix=0.0, cells=np.zeros(0, np.int64),
-               faces=np.zeros(0, np.int64))
+               faces=np.zeros(0, np.int64), D_constraint=0.0, D_wetting=0.0)
     wL, wR = wet[fL], wet[fR]
     cand = wL | wR
     rf = np.minimum(ctx.r[fL], ctx.r[fR])
@@ -78,7 +78,24 @@ def flow(ctx, q, dt):
     G0m = -(DA + rb[fR] * DB) / dx
     gamon = ctx.gam_f > 0
 
+    # A face can move this step only if its force at the old state exceeds its threshold in a direction it is
+    # allowed to flow (DYNAMICS.md §4.1, "Quiet faces"). If none can, u = 0 is the minimiser of the step's convex
+    # problem for every orientation, the state is returned bit for bit, and nothing is assembled or solved.
+    # (A face with a threshold is at it to rounding when its force exceeds it by less than RELEASE_TOL of the largest
+    # force, the rule the active set uses to release a stuck face.)
+    # (A face with a threshold is at it to rounding when its force exceeds it by less than RELEASE_TOL of the force's
+    # own rounding scale, the size of the potentials it is a difference of, or of the largest force.)
+    sc0 = max(float(np.max(np.abs(G0p[allowp]), initial=0.0)), float(np.max(np.abs(G0m[allowm]), initial=0.0)))
+    aA, aB = np.abs(A), np.abs(B)
+    pr = (aA[fL] + aA[fR]) / dx
+    pp_, pm_ = pr + rb[fL] * (aB[fL] + aB[fR] + np.abs(DB - G.D(B))) / dx, pr + rb[fR] * (aB[fL] + aB[fR] + np.abs(DB - G.D(B))) / dx
+    tolp, tolm = RELEASE_TOL * np.maximum(sc0, pp_), RELEASE_TOL * np.maximum(sc0, pm_)
+    movp = allowp & np.where(Y > 0, G0p - Y > tolp, G0p > 0)
+    movm = allowm & np.where(Y > 0, -G0m - Y > tolm, -G0m > 0)
+    if not (movp | movm).any():
+        return q, rep
     o = _orient(G0p, G0m, allowp, allowm)
+    mov = np.where(o > 0, movp, movm) & (o != 0)
     capc = (dx / dt) * h                              # what a cell can give in this step, as a flux
     cache = {}
 
@@ -167,13 +184,14 @@ def flow(ctx, q, dt):
         U[act] = Ma * (Gd[act] - oa * (Y[act] + lam[dcell]))
         return U, Gd, lam, cells, capf
 
-    # orientation: the sign of a two-way Newtonian predictor with the old force's donors, where allowed
+    # orientation: the sign of a two-way Newtonian predictor with the old force's donors, where allowed, solved on
+    # the faces that can move at the old state (every oriented face of a Newtonian film); a face below its threshold
+    # keeps the old force's direction (R5: a frozen choice; any orientation keeps the energy argument)
     nocell = np.zeros(N, bool)
     Gd0 = np.where(o > 0, G0p, G0m)
     rbd = np.where(o > 0, rb[fL], rb[fR])
-    if np.any(o != 0):
-        Up = solve(o != 0, nocell, o, Gd0, rbd, np.zeros(G.nF))[0]
-        o = np.where((Up > 0) & allowp, 1, np.where((Up < 0) & allowm, -1, 0)).astype(np.int8)
+    Up = solve(mov, nocell, o, Gd0, rbd, np.zeros(G.nF))[0]
+    o = np.where(mov, np.where((Up > 0) & allowp, 1, np.where((Up < 0) & allowm, -1, 0)), o).astype(np.int8)
     Gd0 = np.where(o > 0, G0p, G0m)                 # the force with the oriented donor's density
     rbd = np.where(o > 0, rb[fL], rb[fR])
     donor = np.where(o > 0, fL, fR)
@@ -181,9 +199,14 @@ def flow(ctx, q, dt):
     # primal active-set method for the convex problem in u = o U >= 0 with each cell's outflow <= its content
     # (DYNAMICS.md §4.1): iterates stay feasible and each step lowers the objective, so it cannot cycle.
     oriented = o != 0
-    free = oriented & ((Y == 0) | (o * Gd0 - Y > 0))
+    free = oriented & ((Y == 0) | (o * Gd0 - Y > np.maximum(RELEASE_TOL * scale, np.where(o > 0, tolp, tolm))))
     sat = nocell.copy()
     seen, single = set(), False
+    # a face released and then blocked again with no step taken (alpha = 0) is at its threshold to rounding: it stays
+    # stuck for the rest of this step (otherwise a degenerate pair of moves can repeat forever)
+    bounced = np.zeros(G.nF, bool)
+    released = np.zeros(G.nF, bool)
+    tolo = np.where(o > 0, tolp, tolm)
     seen_pd, primal = set(), False
     u = np.zeros(G.nF)
     U = np.zeros(G.nF)
@@ -201,7 +224,7 @@ def flow(ctx, q, dt):
         over = ~sat & (outs > capc)
         if not neg.any() and not over.any():
             u, U, lam = us, Us, lam_s
-            rel_f = oriented & ~free & (o * Gd - Y - lam[donor] > RELEASE_TOL * scale)
+            rel_f = oriented & ~free & ~bounced & (o * Gd - Y - lam[donor] > np.maximum(RELEASE_TOL * scale, tolo))
             rel_c = sat & (lam < -RELEASE_TOL * scale)
             if not rel_f.any() and not rel_c.any():
                 break
@@ -217,6 +240,7 @@ def flow(ctx, q, dt):
                 else:
                     rel_c = np.zeros_like(rel_c); rel_c[int(np.argmax(vc))] = True; rel_f = np.zeros_like(rel_f)
             free |= rel_f
+            released = rel_f
             sat &= ~rel_c
             continue
         if not primal:
@@ -237,6 +261,8 @@ def flow(ctx, q, dt):
         alpha = float(min(rf_.min(), rc_.min()))
         u = u + alpha * (us - u)
         bf = neg & (rf_ <= alpha)
+        if alpha <= 0.0:
+            bounced |= bf & released
         u[bf] = 0.0
         free &= ~bf
         sat |= over & (rc_ <= alpha)
@@ -268,10 +294,19 @@ def flow(ctx, q, dt):
         raise Reject("flow: negative amount")
     dqc = dq[:, cells]
     dh = dq.sum(0)
-    dE = dF_grav(ctx, cells, q[:, cells], dqc) + dF_cap(ctx, capf, h, dh) + dF_wet(ctx, cells, h[cells], dh[cells])
+    dEw = dF_wet(ctx, cells, h[cells], dh[cells])
+    dE = dF_grav(ctx, cells, q[:, cells], dqc) + dF_cap(ctx, capf, h, dh) + dEw
+    # the explicit (concave) wetting term's share of D_num, its Bregman divergence -(dF_wet - <dF_wet/dh(h^n), dh>) >= 0:
+    # O(dt^2) where the film is thicker than ell, O(1) where a cell crosses ell (the contact line moves a cell, which a
+    # molecular ell does not resolve: DYNAMICS.md §9)
+    Dw = max(0.0, -(dEw - dx ** 2 * float(np.sum(mu_wet(ctx, h[cells], cells) * dh[cells])))) if ctx.Swet is not None else 0.0
     mx0, mx1 = mixing(ctx, q[:, cells]), mixing(ctx, qn[:, cells])
     dFmix = 0.0 if mx0 is None else dx ** 2 * np.sum((mx1[0] + mx1[3]) - (mx0[0] + mx0[3]))
     au = absU[act]
+    # the reaction of the cells that gave all they held: its work dt dx^2 sum lam_donor |U| is the constraint's share
+    # of D_num (DYNAMICS.md §5, "Constraints"), reported apart: it is O(1) in dt (a cell empties, or dewets, whatever
+    # the step), so it is not a time-step error
+    Dc = dt * dx ** 2 * float(np.sum(np.maximum(lam[donor[act]], 0.0) * au)) if sat.any() else 0.0
     rep.update(D_viscous=dt * dx ** 2 * np.sum(au * au / M[act]), D_plastic=dt * dx ** 2 * np.sum(Y[act] * au),
-               dE=dE, dF_mix=dFmix, cells=cells, faces=act)
+               dE=dE, dF_mix=dFmix, cells=cells, faces=act, D_constraint=Dc, D_wetting=Dw)
     return qn, rep

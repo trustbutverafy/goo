@@ -30,8 +30,10 @@ a shape when its centre is. `"units": "m"` in a description gives metres from th
 `union`, `intersection`, `difference` (the first minus the rest). Paths: a point `[x, y]`, a polyline, or
 `{"points": ..., "smooth": n}` (Chaikin corner cutting, ends kept).
 
-A footprint is flat-topped: every cell whose centre lies within the radius of the spout's segment gets the same
-share. A tapering profile (a swept disc's chord, a paraboloid cap) was tried first and puts vanishingly thin films
+A footprint is flat-topped by default: every cell whose centre lies within the radius of the spout's segment gets
+the same share. `edge` (a length, on pour, flood and spray; default 0) tapers it: the share falls linearly to 0
+over `edge` inside the rim (flood: inside the region's boundary, by the distance transform; spray: the landing
+density in the cone, drawn through the tabulated inverse CDF). A tapering profile (a swept disc's chord, a paraboloid cap) was tried first and puts vanishingly thin films
 on its edge cells, which today's world cannot step (§8); flat footprints have a step at their edge instead, which
 the world's slope flag reports. The fraction of a footprint off the panel is computed on the extended grid and
 booked to a reservoir.
@@ -81,6 +83,11 @@ Each is `World.set_environment`, whose change of F is booked as `work[environmen
 
 ## 6. Clocks and settle
 
+When every cell is held (a hold over the whole panel, or tape and holds covering it) the bench does not call the
+world: a step at rate 0 returns the state bit for bit and only moves the clock (O4, DYNAMICS.md §7), so the bench
+sets `World.t` forward itself, reports `held seconds`, and flags the privilege with amount 0. Under a full hold a
+pour, flood or spray therefore costs only its deposition.
+
 `wait(duration, rate=1, where=None)` lets time pass with the clock rate `rate` in `where` (default everywhere), 0
 in held and taped cells, 1 elsewhere. With no hold, tape or rate the world runs unprivileged (`rate=None`). A rate
 field != 1 anywhere makes the world flag each step; the bench sums those into one flag,
@@ -90,7 +97,9 @@ anything runs (reverse is not implemented). `hold(region)` and `release(region)`
 
 When the world has `advance(duration, rate=...)`, wait and the sources' pieces call it. Until then the bench's
 stepper takes `steps` implicit steps (default 10) whose sizes double, the last ending exactly at the duration's
-sum; a source's piece is one step. Each step is taken on a fork and adopted only if the world accepts it: a step
+sum; a source's piece is one step. With `World.advance` the bench calls it in place: a Bench act is not atomic (a world that fails part way leaves
+its partial work, and the bench raises PortError); a Session makes acts atomic. In the fallback stepper each step
+is taken on a fork and adopted only if the world accepts it: a step
 the world gives up on (RuntimeError) has already committed part of itself, so it is never taken on the bench's
 world. It is retried as three steps of a third, to a depth of 2, each retry counted in `world step retries`.
 
@@ -111,7 +120,8 @@ of cells that could still flow.
 
 Every act's receipt: the world's entries and the bench's, in the world's ledgers, in order; the residuals (matter:
 the larger of the world's and the bench's closure, which compares every account it can — wet, ground, strata,
-every vessel and tape, overspray and spill — with the state, over the mass held; energy: the world's); F by term
+every vessel and tape, overspray and spill — with their state, over the mass the ledger says is held, at a cost
+independent of the panel; the world's own accounts are closed by the world's receipts; energy: the world's); F by term
 before and after; the flags (privileges consolidated, other flags deduplicated); and the report summed (the world's
 dissipation by mechanism, D_num, max slope, rate integral) with the act's own numbers (laid m^3, shortfall,
 droplets, seed, pieces, cells retired, retries).
@@ -141,6 +151,14 @@ droplets, seed, pieces, cells retired, retries).
 6. **Thick pours are slow**: a pour of 20 uL along a 2 mm wide, 11 mm path (0.9 mm of film, slope 0.56) took 423 s
    on 48 x 64 cells; the same pour of 2 uL took 0.9 s. Pours of a few tens of micrometres are the first rung's
    domain anyway (the thin-film slope flag fires above 0.1).
+
+7. **A stale step region** (World.step): a step's region R is the union of its window and `_dirty`, and the step
+   then sets `_dirty = R`, so a large box touched once (a flood, a settle) is re-evaluated by every later step.
+   On 1024 x 768 after a flood over 800 x 500 cells, a 0.5 uL pour of 16 pieces on a held panel cost 9 s, almost
+   all in `_relabel` and `_coefficients` on that box. Not worked around (the held case is skipped, §6).
+8. **A forced settle freezes a wet film.** `settle(force=True)` retires the film as it is, its volatile liquid
+   included; the receipt reports `volatile retired kg NAME` per volatile substance (a description's `volatile`,
+   p_sat > 0) and the journal's summary line says FROZE WET FILM with the amounts.
 
 ## 9. What is privileged or faked, and unverified
 

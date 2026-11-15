@@ -264,3 +264,95 @@ def test_the_command_line_round_trips_a_small_session(tmp_path, capsys):
     r = subprocess.run([sys.executable, "-m", "goo.journal", d, "vocab"], capture_output=True, text=True,
                        cwd=ROOT, env={"PYTHONPATH": str(ROOT), "PATH": "/usr/bin:/bin"})
     assert r.returncode == 0 and "spray" in r.stdout
+
+
+# ------------------------------------------------------------------------------------------- size and pictures
+HELD = [{"act": "hold", "region": "all"}]
+
+
+def test_a_saved_session_is_the_size_of_its_arrays_and_continues_identically(tmp_path):
+    from goo.journal import store
+    s = session(HELD + [{"act": "flood", "vessel": "cup", "region": {"rect": [2, 2, 20, 12]}, "thickness": "8 um"},
+                        {"act": "settle", "force": True}], W=96, H=64)
+    blob = store.dumps(s)
+    raw = sum(a.nbytes for a in _world_arrays(s))
+    assert len(blob) < 0.2 * raw
+    t = store.loads(blob)
+    assert t.digest() == s.digest() and t.entries == s.entries
+    more = {"act": "flood", "vessel": "jar", "region": {"disc": [60, 30, 8]}, "thickness": "5 um"}
+    s.do(more); t.do(more)
+    assert t.digest() == s.digest() and t.entries[-1]["receipt"] == s.entries[-1]["receipt"]
+
+
+def test_the_command_line_keeps_few_checkpoints_and_goes_back_through_them(tmp_path, capsys):
+    from goo.journal import cli
+    d = str(tmp_path / "s")
+    main([d, "new", "--size", "48x32", "--ground", "calcite", "--porosity", "0", "--pore-radius", "1um",
+          "--depth", "100um", "--substances", "water,gum_arabic,hematite"])
+    for a in BASE + HELD:
+        assert main([d, "do", json.dumps(a)]) == 0
+    for k in range(20):
+        assert main([d, "do", json.dumps({"act": "drop", "vessel": "cup", "at": [2 + 2 * k, 10],
+                                          "volume": "0.002 uL"})]) == 0
+    bdir = tmp_path / "s" / "branches" / "main"
+    ck = sorted(p.name for p in (bdir / "ckpt").iterdir())
+    assert ck == ["0000.pkz", "0010.pkz", "0020.pkz"]
+    j = json.loads((bdir / "journal.json").read_text())
+    assert main([d, "checkpoint"]) == 0
+    assert main([d, "back", "7"]) == 0                       # 25 -> 18: checkpoint 10, then 8 entries replayed
+    s, _ = cli._load(bdir)
+    assert len(s.entries) == 18 and s.digest() == j["entries"][17]["world"]
+    assert "0025.keep.pkz" not in {p.name for p in (bdir / "ckpt").iterdir()}
+    total = sum(p.stat().st_size for p in bdir.rglob("*") if p.is_file())
+    assert total < 2_000_000
+    capsys.readouterr()
+
+
+def test_a_picture_reuses_unchanged_cells_exactly_and_scales_down_in_linear_light():
+    s = session(HELD + [{"act": "flood", "vessel": "cup", "region": {"rect": [2, 2, 20, 12]}, "thickness": "8 um"},
+                        {"act": "settle", "force": True},
+                        {"act": "flood", "vessel": "jar", "region": {"disc": [24, 16, 5]}, "thickness": "5 um"}],
+                W=40, H=28)
+    cache = {}
+    p = s.picture(cache=cache, gloss=True, infrared=True)
+    L = s.look(gloss=True, infrared=True)
+    assert p.solved == p.cells == 40 * 28
+    assert np.array_equal(p.image, L.image) and np.array_equal(p.gloss_image, L.gloss_image)
+    assert np.array_equal(p.infrared_image, L.infrared_image)
+    s.do({"act": "drop", "vessel": "cup", "at": [35, 5], "volume": "0.01 uL"})
+    q = s.picture(cache=cache, gloss=True, infrared=True)
+    L2 = s.look(gloss=True, infrared=True)
+    assert 0 < q.solved < 20 and np.array_equal(q.image, L2.image) and np.array_equal(q.gloss_image, L2.gloss_image)
+    s.do({"act": "settle", "force": True})                   # wet film -> stratum: same optics, nothing to solve
+    assert s.picture(cache=cache).solved == 0
+    half = s.picture(cache=cache, scale=0.5)
+    assert half.image.shape == (14, 20, 3) and half.solved == 0
+    from goo.observe import colour as C
+    rgb = cache["rgb"]
+    want = C.srgb8(rgb.reshape(14, 2, 20, 2, 3).mean((1, 3)))
+    assert np.array_equal(half.image, want)
+    crop = s.picture(cache=cache, region={"rect": [10, 4, 30, 20]})
+    assert crop.image.shape == (16, 20, 3) and np.array_equal(crop.image, s.look().image[4:20, 10:30])
+    with pytest.raises(ValueError, match="fraction"):
+        s.picture(scale=0.3)
+
+
+def test_the_adapters_give_the_maps_answers_bit_for_bit():
+    """Session.Maps.mixing and looking.Optics evaluate maps once per distinct cell and gather: exact."""
+    from goo.substance import maps, library as L
+    from goo.film import Film, Ground, Stack, Light
+    from goo.light import look
+    from goo.journal.session import Maps
+    from goo.journal.looking import OPTICS, bands_of
+    subs = (L.WATER, L.GUM_ARABIC, L.HEMATITE)
+    rng = np.random.default_rng(1)
+    q = np.zeros((3, 64, 80)); q[:, :, :40] = np.array([16e-6, 3e-6, 1e-6])[:, None, None]
+    q[:, 5:15, 50:70] = rng.uniform(0, 5e-6, (3, 10, 20))
+    a, b = maps.mixing(Film(subs, q)), Maps().mixing(Film(subs, q))
+    assert all(np.array_equal(x, y, equal_nan=True) for x, y in zip(a.value, b.value)) and a.map == b.map
+    bands = bands_of({})
+    g = Ground(np.zeros((64, 80)), L.CELLULOSE, 0.5, 5e-6, 2e-4, subs)
+    st = Stack(g, [Film(subs, q), Film(subs, q[:, ::-1])], 1e-4)
+    l1, l2 = look(st, bands, Light(bands, np.ones(bands.B)), maps), look(st, bands, Light(bands, np.ones(bands.B)), OPTICS)
+    for k in ("reflectance", "specular", "diffuse", "absorbed", "ground", "transmitted"):
+        assert np.array_equal(getattr(l1, k), getattr(l2, k)), k

@@ -157,12 +157,21 @@ def along(points, s):
     return np.stack([x, y], -1)
 
 
-def footprint(p, q, radius, H, W):
+def taper(d, edge):
+    """Weight of a cell at distance d (cells) inside a footprint's rim: 1 deeper than `edge`, falling linearly to 0
+    at the rim; with edge 0, 1 everywhere inside (a flat top)."""
+    if edge <= 0:
+        return (d >= 0).astype(float)
+    return np.clip(d / edge, 0.0, 1.0)
+
+
+def footprint(p, q, radius, H, W, edge=0.0):
     """Where a spout of `radius` (cells) moving from p to q (cell coordinates) lays its matter: weights [H, W] on the
     panel and the fraction that falls off it, together summing to 1. Every cell whose centre is within the radius
-    of the segment gets the same weight (a flat-topped footprint: a profile tapering to zero, such as a swept disc's
-    chord, puts vanishingly thin films at its edge, which today's world cannot step: docs/PORTS.md §8). If no cell
-    centre is within the radius, the nearest cell to the segment's midpoint takes it all."""
+    of the segment gets the same weight, except within `edge` cells of the rim, where the weight falls linearly to
+    0 at the rim (taper). edge 0 (the default) is flat-topped: a tapering profile puts vanishingly thin films at its
+    edge, which the world could not step when this was written (docs/PORTS.md §8). If no cell centre is within
+    the radius, the nearest cell to the segment's midpoint takes it all."""
     p, q = np.asarray(p, float), np.asarray(q, float)
     r = float(radius)
     lo = np.floor(np.minimum(p, q) - r - 1).astype(int)
@@ -171,7 +180,7 @@ def footprint(p, q, radius, H, W):
     rows = np.arange(lo[1], hi[1] + 1)
     Xc, Yc = np.meshgrid(cols + 0.5, rows + 0.5)
     d2 = _seg_dist2(Xc, Yc, p, q)
-    w = (d2 <= r * r).astype(float)
+    w = np.where(d2 <= r * r, taper(r - np.sqrt(d2), float(edge)), 0.0)
     if not np.any(w > 0):
         m = 0.5 * (p + q)
         j, i = int(np.floor(m[0])), int(np.floor(m[1]))

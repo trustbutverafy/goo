@@ -19,6 +19,8 @@ class Grid:
         self.isx = np.zeros(self.nF, bool); self.isx[:self.nx] = True
         self.X = np.broadcast_to(((j0 + np.arange(W)) + 0.5) * self.dx, (H, W)).ravel().copy()
         self.Y = np.broadcast_to((((i0 + np.arange(H)) + 0.5) * self.dx)[:, None], (H, W)).ravel().copy()
+        self.IY = np.repeat(np.arange(i0, i0 + H, dtype=np.int64), W)        # absolute row and column of each cell
+        self.IX = np.tile(np.arange(j0, j0 + W, dtype=np.int64), H)
 
     def D(self, a):
         """Face difference a[R] - a[L] of a cell array [..., N]."""

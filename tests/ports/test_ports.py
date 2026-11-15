@@ -234,23 +234,90 @@ def test_settle_retires_what_cannot_flow_and_force_is_a_privilege():
     assert np.all(b.world.q[:, b.region({"rect": [4, 4, 16, 20]})] == 0)
 
 
-def test_a_failing_world_step_is_never_half_taken():
-    """A step the world gives up on is taken on a fork and dropped (bench._step), so the bench's world is unchanged."""
+def test_a_failing_world_advance_is_refused_and_a_session_restores():
+    """A Bench act is not atomic: a world that fails part way leaves its partial work. The bench says so (PortError);
+    a Session (tests/journal) does every act on a fork and keeps it only on success."""
     b = bench()
     b.flood("cup", {"rect": [4, 4, 28, 20]}, 10 * um)
-    d = b.world.digest()
-    orig = type(b.world).step
+    W = type(b.world)
 
-    def bad(self, dt, **kw):
-        orig(self, dt / 2, **kw)                             # commits half, then fails, as World.step can
+    def bad(self, duration, **kw):
+        self.t += duration / 2                               # part of the duration taken, then a failure
         raise RuntimeError("step could not be accepted")
-    type(b.world).step = bad
+    orig = getattr(W, "advance", None)
+    W.advance = bad
     try:
-        with pytest.raises(PortError, match="could not take a step"):
-            b.wait(1.0, steps=1)
+        with pytest.raises(PortError, match="could not advance"):
+            b.wait(1.0)
     finally:
-        type(b.world).step = orig
-    assert b.world.digest() == d
+        if orig is None:
+            del W.advance
+        else:
+            W.advance = orig
+
+
+def test_a_fully_held_panel_moves_only_its_clock():
+    b = bench()
+    b.flood("cup", {"rect": [4, 4, 28, 20]}, 10 * um)
+    b.hold("all")
+    st = b.world.state_digest()
+    r = b.wait(30.0)
+    assert b.world.t == 30.0 and r.report["held seconds"] == 30.0
+    assert any(f.kind == "privilege" and f.subject == "painter" and f.amount == 0.0 for f in r.flags)
+    b.world.t = 0.0
+    assert b.world.state_digest() == st
+
+
+def test_a_tapered_flood_under_a_hold_lays_a_soft_edge():
+    """edge > 0: the film's thickness falls linearly to 0 over `edge` inside the region; nothing steps."""
+    b = bench(W=40, H=30)
+    b.hold("all")
+    r = b.flood("cup", {"rect": [5, 5, 35, 25]}, 10 * um, edge=1 * mm)        # 4 cells of 0.25 mm
+    closes(r)
+    h = b.world.q.sum(0)
+    assert h[15, 20] == pytest.approx(10 * um, rel=1e-12)                    # deep inside: the full thickness
+    row = h[15, 5:12]
+    assert np.all(np.diff(row) >= 0) and row[0] < 0.2 * 10 * um and row[0] > 0
+    assert h.sum() * b.dx ** 2 == pytest.approx(r.report["laid m^3"], rel=1e-12)
+    assert not np.any(h[:5]) and not np.any(h[:, 35:])
+    flat = bench(W=40, H=30)
+    flat.hold("all")
+    flat.flood("cup", {"rect": [5, 5, 35, 25]}, 10 * um)
+    assert np.all(flat.world.q.sum(0)[5:25, 5:35] == pytest.approx(10 * um, rel=1e-12))
+
+
+@pytest.mark.xfail(reason="stepping a tapered edge needs the world's floor rule for vanishing films (being added "
+                          "by the dynamics owner): docs/PORTS.md §8", strict=False)
+def test_a_tapered_flood_steps():
+    b = bench(W=40, H=30, ground="paper", humidity=0.5)
+    b.flood("cup", {"rect": [5, 5, 35, 25]}, 10 * um, edge=1 * mm)
+    closes(b.wait(30.0))
+
+
+def test_tapered_pour_and_spray_edges():
+    b = bench(W=48, H=32)
+    b.hold("all")
+    closes(b.pour("cup", [[10, 16], [38, 16]], 0.3 * uL, 0.0, 3 * mm, edge=1 * mm))
+    h = b.world.q.sum(0)
+    assert h[16, 24] > h[12, 24] > 0 and h[16, 24] == pytest.approx(h[15, 24], rel=1e-12)
+    c, d = bench(W=48, H=32), bench(W=48, H=32)
+    for x, e in ((c, 0.0), (d, 1.5 * mm)):
+        x.hold("all")
+        closes(x.spray("cup", [[24, 16], [24, 16]], 0.2 * uL, 1.0, 2 * mm, 40 * um, seed=3, edge=e))
+    rim = lambda x: x.world.q.sum(0)[16, 24 + 6:24 + 8].sum() / x.world.q.sum(0)[15:18, 23:26].mean()
+    assert rim(d) < 0.7 * rim(c)
+
+
+def test_a_forced_settle_says_it_froze_a_volatile():
+    b = bench()
+    b.hold("all")
+    b.flood("cup", {"rect": [4, 4, 28, 20]}, 10 * um)
+    r = b.settle(force=True)
+    closes(r)
+    w = r.report["volatile retired kg water"]
+    assert w == pytest.approx(10 * um * 24 * 16 * b.dx ** 2 * 0.85 * L.WATER.rho, rel=1e-12)
+    from goo.journal import summary
+    assert "FROZE WET FILM" in summary(r) and "water" in summary(r)
 
 
 def test_a_wash_dries_on_paper():

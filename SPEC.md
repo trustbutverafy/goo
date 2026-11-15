@@ -372,14 +372,18 @@ K0  units, evidence, ledger, film                                             do
                                                                               test-side shims (tests/substance/test_world_protocol.py); wetting left out
 K1  docs/DYNAMICS.md; the step with O1 to O8 on the first terms              built; owner's tests pass against analytic laws (tests/world/); not yet refereed
     real substances through the step, with wetting and sorption, no shims     tested on a 6 x 6 world (tests/substance/test_world_protocol.py)
-    owed: the iterative solver (the exact one takes 3 s a step at 25,000 active cells of water, 36 s at 113,000,
-    and fails on three substances at that size); cure (needs the reaction's free energy) and dissolution (xfail);
-    surface tension is lagged (no Marangoni stress)
+    the painter's cases (pigment in gum water drying, two paints meeting wet, a tilt, a pour over strata, a paste, a
+    latex-thickened paint) step on 96 x 96 and 160 x 120 panels (tests/world/test_world_painting.py); a step is all or
+    nothing; amounts below one molecule a cell are carried but do not diffuse (DYNAMICS.md, rule R7)
+    owed: speed (a quiet step on 1024 x 768 takes 16 to 30 s; moving paint at 300,000 cells is out of reach); a
+    gum-bound film never reaches a state `settle()` retires (its viscosity stays finite); pore water does not
+    evaporate; cure (needs the reaction's free energy) and dissolution (xfail); surface tension is lagged
 K2  light on the first rung with G1 to G7                                    built; owner's tests pass (tests/light/); not yet refereed
 K3  ports, the first bodies, journal, replay, clocks                         built without a mechanical port: paints, vessels, pour, flood, drop, drip,
-    spray, tape, tilt, air, wait, hold, settle; a journal with bit-identical replay; a command line. NOT PASSING against
-    the current world: its suite fails where World.advance cannot take a step on real paint (owed by the world), and a
-    1024 x 768 session costs about 1 GB of disk for five acts (owed by the journal). No brush or blade.
+    spray, tape, tilt, air, wait, hold, settle; a journal with bit-identical replay; a command line; owner's tests pass
+    (tests/ports/, tests/journal/); not yet refereed. Owed: a brush and a blade (the world has no wall riding on the
+    film); a look of a whole 1024 x 768 painting runs out of memory unless taken tile by tile; substances beyond the
+    library cannot be named in a session's description.
 K4  the lab and observers                                                    built; owner's tests pass (tests/lab/, tests/observe/); not yet refereed
     owed: the observer's fit is unverified and the daylight is a 6504 K blackbody; no gain saturation; no coalescence
     term for latex; known wrong results are listed in docs/LAB.md §8

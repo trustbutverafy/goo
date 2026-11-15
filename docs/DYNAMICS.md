@@ -173,6 +173,30 @@ iterations; only if a working set repeats does it switch to the primal method ab
 Then each substance moves in flux form, q_i ← (1 − α_c) q_i + inflow_i with
 α_c = outflow_c/hⁿ_c ≤ 1 (exactly 1 for a saturated cell).
 
+*Quiet faces.* A face can move this step only if, at the old state, its force exceeds its threshold in a direction
+it may flow (o G⁰_f > Y_f for o = +1 with donor L, or o = −1 with donor R; for Y = 0, o G⁰ > 0). If no face can,
+the step returns the state bit for bit and nothing is assembled. Proof: for any orientation o, Φ is convex on the
+feasible cone u ≥ 0 (with the outflow bounds), u = 0 is feasible, and at u = 0 the state is yⁿ, so the force is G⁰
+and ∂Φ/∂u_f(0) = dt dx² (Y_f − o_f G⁰_f) ≥ 0 for every face. These are the KKT conditions of the cone at u = 0 (every
+multiplier of u_f ≥ 0 is ∂Φ/∂u_f ≥ 0, every outflow bound is slack with multiplier 0), so u = 0 minimises Φ; the
+minimiser of a convex function on a convex set is a minimiser, and Φ's quadratic part (dt dx² Σ u²/(2rM), M > 0 on
+every face that could carry flow) makes it strictly convex in u, so u = 0 is *the* solution: what the full solve
+would return, without solving. A paste below yield, a held clock, a level film: nothing is factorised. In a mixed
+panel the orientation predictor is solved on the faces that can move only; a face below its threshold keeps the
+old force's direction (R5: a frozen choice; any orientation keeps §5), and the solves of the active set are on the
+cells of its free faces, so a stiff paste costs nothing next to a moving wash. A face with a threshold is *at* it to
+rounding when its excess is below 1e-12 of max(the largest force, the size of the potentials it is a difference of,
+(|A_L| + |A_R| + ρ^d(|B_L| + |B_R|))/dx): its force is not known better than that. The same bound decides release in
+the active set, and a face released and then blocked again with no step taken (α = 0) stays stuck for the rest of
+the step: such a pair of moves is degenerate at rounding and would otherwise repeat (observed: 400 iterations on a
+water pour, alternating one face in and out with an excess of 4e-12).
+
+*The constraint's share.* A saturated cell's multiplier λ_c ≥ 0 is the reaction against its outflow; its work
+dt dx² Σ_f λ_donor |U_f| is inside D_num (§5, "Constraints") and is reported apart (`D_num constraint`), together
+with the explicit wetting term's Bregman divergence −(ΔF_wet − ⟨∂F_wet(hⁿ), δh⟩) ≥ 0. Both are O(1) in dt where a
+cell empties or crosses ℓ (a dewetting contact line moves one cell, whatever the step), so they are not a measure
+of the time step's error and `advance` does not read them as one (§9a).
+
 *Acceptance*: any substep that fails (the active set or a Newton iteration does not settle, an amount
 would be negative) is redone as two half steps, deterministically and recursively, to a depth of 24, then
 an error. The capillary stiffness is implicit and is not limited; nothing is limited by a Courant number.
@@ -190,6 +214,20 @@ where it does not, the flux is rounding too and either donor is an admissible mo
 amount whose iterate falls below e⁻³⁰ of the cell gets no inflow and is dropped exactly, its faces
 carrying none of it (the entry rule, R6, applied during the solve).
 Common parts of μ (capillary, wetting, the h-derivatives of gravity) cancel exactly under L·1 = 0.
+
+*Sub-molecular amounts* (**R7**). A substance holding less than one of its molecules (or particles) in a cell,
+0 < q_i < v_i/dx² (v_i its molecular volume; 0 for a phase without one, which never diffuses), is carried exactly
+but does not diffuse this step: every face touching that cell has ω_i = 0. This is a statement about arithmetic,
+not physics: a continuum flux of less than one molecule has no meaning, and its Newton iterate in ln q can fall
+by hundreds of decades (observed: 1e-155 m at a thin front, where the mixing Hessian's c/q overflowed and the
+factorisation was singular for every dt). O1 and O2 are untouched (the pair has no flux; its amount is carried
+bit for bit), and §5 holds because it holds for any ω ≥ 0. Above the floor nothing changes (tested: a scene whose
+amounts all exceed it gives the same arrays with the floor set to 0). Two further rules keep the iteration finite
+without changing its answer: an iterate below the floor enters the Jacobian (only the path) at the floor, where the
+Hessian is finite, and a pair's update is converged when below 1e-12 of its amount, 1e-14 of its cell's thickness
+or 1e-12 of the gross amount the fluxes carry through it (the flux-form update is a sum of those terms and is not
+known better; a 1e-21 m cell next to a 5e-6 m one could otherwise never converge). A Jacobian that is not finite,
+and a factorisation that fails, reject the substep (it halves); they never escape as errors.
 
 *Entry* (**R6**): a substance enters a neighbouring cell that lacks it only if, at e⁻³⁰ of the donor's
 fraction, the relative force at the old state still drives it in. Where it would not, its equilibrium
@@ -346,10 +384,28 @@ increasing equation at fixed q', so both are bracketed and bisected to the last 
 the case where the residual at 0 is still ≥ 0. (Newton oscillated on real water in cellulose, between filling
 the pores past what the film held and the one-way valve shutting.)
 
-*advance(duration)* covers world time with steps whose size follows the step's own error estimate,
+*Newton's inner solves* (diffusion), under both solvers, are GMRES to a relative residual of 1e-10 preconditioned by
+block Jacobi over each cell's unknowns, then (if that misses within 12 iterations) by aggregation multigrid on the
+active set (`multigrid.py`: 2 x 2 aggregates in absolute panel coordinates, so a window builds the same hierarchy as
+the panel; damped block-Jacobi smoothing; the coarsest level factorised), then a factorisation. The answer is
+the nonlinear iterate, judged on its own residual (the convergence test adds a residual check so that a stalled
+inner solve cannot pass as converged), so the inner tolerance sets the path and not the result: O3's argument
+is unchanged, exactly as for the chord iteration, which already solves with a stale Jacobian. The system is
+assembled on the substances that move on some face only (the others have ω = 0: no rows of L).
+
+*advance(duration, rate)* covers world time with steps whose size follows the step's own error estimate,
 e = D_num(time)/energy moved (the Bregman divergence, O(dt²) per step): double after e ≤ tol/4, halve after
 e > tol (tol 1e-3), divide by the pieces after a halving. It reads only receipts, so it is the same in a
-window and on the panel.
+window and on the panel. What it reads: D_num time less its constraint share (above) and, when a cell drained dry
+in the local step, less the local step's part; against the energy moved, floored at k_B T per cell of the region
+and at half the recent power (the moved energy per second of the last steps, averaged) times dt, so a step in which
+little happens is not held to a relative error on the little it moved. Only a full step (not the remainder that
+lands on the end) sets the next size. A halving that does not lower e by a quarter shows an error that is not the
+time step's: the size returns to the one before and is held until e falls below tol/4. A step the world cannot
+take (`StepFailed`, after its 24 halvings) leaves the world exactly as it was (the step is all or nothing: what its
+accepted pieces committed is undone) and is retried at a quarter of its size; below 1e-9 of the duration advance
+stops and returns what it did, with a `solver` flag saying where and why. The clock's privilege is summed over
+the steps into one flag (equal flags of equal steps would otherwise merge when receipts add).
 
 *settle()* retires every wet cell whose viscosity is +inf (no liquid left, or jammed particles): mobility is
 exactly zero there, so retiring loses no freedom. A film that still holds a liquid is not touched.

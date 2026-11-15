@@ -32,6 +32,7 @@ class Ctx:
     flags: list
     solver: str = "exact"
     stats: dict = None
+    memo: list = None
 
     @property
     def g(self):
@@ -67,6 +68,26 @@ def mixing(ctx, qc):
     fn = getattr(ctx.con, "mixing", None)
     if fn is None:
         return None
+    # the maps are functions of the amounts, so the same amounts give the same numbers: the last few evaluations of
+    # a piece are kept and returned for equal input (bit for bit), which the substeps meet at their boundaries
+    memo = ctx.memo
+    if memo is not None:
+        for k, (qm, out) in enumerate(memo):
+            if qm.shape == qc.shape and np.array_equal(qm, qc):
+                return out
+    out = _mixing(ctx, qc)
+    if memo is not None:
+        memo.insert(0, (np.array(qc, copy=True), out))
+        del memo[MEMO:]
+    return out
+
+
+MEMO = 3
+
+
+def _mixing(ctx, qc):
+    S, n = qc.shape
+    fn = ctx.con.mixing
     with np.errstate(divide="ignore", invalid="ignore"):
         from goo.world.protocol import unwrap
         mx = unwrap(fn(Film(ctx.substances, qc[:, None, :]), ctx.env.T), "mixing", ctx.flags)
