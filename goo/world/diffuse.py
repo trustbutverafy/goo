@@ -1,12 +1,12 @@
 """Substep 2: relative fluxes of the substances at fixed thickness, Onsager form (DYNAMICS.md §3, §4.2)."""
 import numpy as np
 import scipy.sparse as sp
-from scipy.sparse.linalg import splu
+from goo.world.linsolve import Factor
 from goo.world.common import Reject, coeff, mixing, dF_grav, dF_cap, dF_wet, dF_exch
 
 MAX_NEWTON = 60
-LOG_STEP = 300.0     # largest fall of ln q in one iteration (keeps amounts representable)
-LOG_RISE = 2.0       # largest rise of ln q in one iteration (a damping)
+LOG_STEP = 8.0       # largest fall of ln q in one iteration (a damping; e^-30 is reached in four)
+LOG_RISE = 8.0       # largest rise of ln q in one iteration (a damping)
 ENTRY_PECLET = 30.0  # a substance does not enter a cell where its equilibrium share would be below exp(-30) of
                      # its donor's: such amounts are not representable against the fluxes that balance them
 START = 1e-3          # first Newton iterate, as a fraction of the neighbour's, for a substance entering a cell (not physics:
@@ -141,7 +141,7 @@ def diffuse(ctx, q, dt):
         # chord Newton: keep the factors of the last Jacobian while the residual falls at least tenfold per
         # iteration and the upwind directions are those it was built with; otherwise refactor
         if lu is None or not np.array_equal(up, lu_up) or rn > 0.1 * prev:
-            lu, lu_up = splu(_jacobian(S, n, nu, unk, iL, iR, up, kap, hc, mx[2], omg, W, X, Xb, c, dt, dx)), up.copy()
+            lu, lu_up = Factor(_jacobian(S, n, nu, unk, iL, iR, up, kap, hc, mx[2], omg, W, X, Xb, c, dt, dx), ctx.solver, ctx.stats), up.copy()
         prev = rn
         d = lu.solve(-r)
         dq = np.zeros((S, n)); dq[pi, pj] = d

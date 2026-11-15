@@ -1,5 +1,6 @@
 """Scenes for the world's tests: physical magnitudes, generated in code."""
 import numpy as np
+import pytest
 from goo.units import um, mm, mPa_s, k_B, T_room
 from goo.world import World, Environment
 from world_analytic import Sub, Analytic, flat_ground, KT_V_SMALL
@@ -44,12 +45,31 @@ def ledger_identity(r):
 
 
 def check_energy(r, tol=1e-12):
+    """The energy identity and the signs. Under the iterative solver D_num's sign is checked at 1e3 times the
+    solver's relative tolerance (SPEC §3: it holds only to the tolerance)."""
     res, moved = ledger_identity(r)
+    ntol = max(1e-12, 1e3 * r.report.get("solver tolerance", 0.0))
     assert res <= tol, f"energy identity residual {res:.3g}"
     for e in r.entries:
         if e.ledger == "energy" and e.dst.startswith("dissipated["):
             if e.dst == "dissipated[numerical]":
-                assert float(e.amount) >= -1e-12 * moved, (e.note, float(e.amount), moved)
+                assert float(e.amount) >= -ntol * moved, (e.note, float(e.amount), moved)
             else:
                 assert float(e.amount) >= 0.0, (e.dst, float(e.amount))
     assert r.residual["energy"] <= 1e-12 and r.residual["matter"] <= 1e-12, r.residual
+
+
+# Every world test runs under both solvers (SPEC §3): `exact`, the reference, and `iterative`. Test modules import
+# this autouse fixture (a conftest.py here would shadow the substance tests' `conftest` module).
+
+
+_init = World.__init__
+
+
+@pytest.fixture(autouse=True, params=["exact", "iterative"])
+def solver(request, monkeypatch):
+    def init(self, *a, **kw):
+        kw.setdefault("solver", request.param)
+        _init(self, *a, **kw)
+    monkeypatch.setattr(World, "__init__", init)
+    return request.param

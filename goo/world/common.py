@@ -30,6 +30,8 @@ class Ctx:
     mu_env: np.ndarray       # [S], 0 where no reservoir
     has_env: np.ndarray      # [S] bool
     flags: list
+    solver: str = "exact"
+    stats: dict = None
 
     @property
     def g(self):

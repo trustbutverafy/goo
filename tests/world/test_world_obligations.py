@@ -4,7 +4,7 @@ import pytest
 from goo.units import um, mm, mPa_s, mN, m, Pa_s, k_B, T_room, g_0
 from goo.world import World, Environment
 from world_analytic import Sub, Analytic, flat_ground, KT_V_SMALL
-from world_scenes import watercolour, check_energy, ledger_identity, SUBS3, WATER, blobs
+from world_scenes import solver, watercolour, check_energy, ledger_identity, SUBS3, WATER, blobs
 
 RHO_W, ETA_W, GAM_W = 998.0, 1 * mPa_s, 72 * mN / m
 
@@ -60,8 +60,9 @@ def test_O3_energy_identity_and_signs_watercolour():
     for _ in range(8):
         r = w.step(0.25)
         check_energy(r)
-        assert r.report["D_num transport"] >= -1e-12 * r.report["energy moved"]
-        assert r.report["D_num time"] >= -1e-12 * r.report["energy moved"]
+        tol = max(1e-12, 1e3 * r.report.get("solver tolerance", 0.0))
+        assert r.report["D_num transport"] >= -tol * r.report["energy moved"]
+        assert r.report["D_num time"] >= -tol * r.report["energy moved"]
 
 
 def test_O3_energy_bingham_wetting_tilt_and_two_densities():

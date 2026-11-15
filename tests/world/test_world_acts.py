@@ -7,7 +7,7 @@ from goo.film import Stack
 from goo.units import um, mm, mPa_s, mN, m, g_0
 from goo.world import World, Environment, Constitutive
 from world_analytic import Sub, Analytic, flat_ground, KT_V_SMALL
-from world_scenes import watercolour, check_energy, WATER, blobs
+from world_scenes import solver, watercolour, check_energy, WATER, blobs
 
 
 def test_clock_rate_zero_holds_the_world_exactly_and_is_a_privilege():
@@ -33,12 +33,18 @@ def test_clock_rate_field_holds_a_region_and_runs_the_rest():
     check_energy(r)
 
 
-def test_clock_scales_dissipation_like_time():
-    """rate r for dt matches rate 1 for r dt, to rounding, for a world whose every process is a Psi*."""
+def test_clock_scales_dissipation_like_time(solver):
+    """rate r for dt matches rate 1 for r dt, to rounding (exact) or the solver's tolerance (iterative)."""
     a, b = watercolour(), watercolour()
     a.step(0.4, rate=0.5)
     b.step(0.2)
-    assert np.allclose(a.q, b.q, rtol=1e-9, atol=1e-18)
+    if solver == "exact":
+        assert np.allclose(a.q, b.q, rtol=1e-9, atol=1e-18)
+    else:
+        # the frozen choices of a step (a face's orientation, an entering amount kept or dropped) are decided on
+        # numbers the solver knows to its tolerance; where one flips, two admissible steps differ at O(dt), not at
+        # the tolerance (observed 1.6e-4 of the film here)
+        assert np.max(np.abs(a.q - b.q)) <= 1e-3 * np.max(a.q)
 
 
 def test_clock_negative_rate_is_refused():
@@ -189,3 +195,45 @@ def test_infinite_viscosity_is_zero_mobility():
     assert np.array_equal(w.q[:, :, 7:], before[:, :, 7:])        # behind the jammed column nothing moved
     assert not np.array_equal(w.q[:, :, :6], before[:, :, :6])
     check_energy(r)
+
+
+def test_the_two_solvers_agree():
+    """SPEC §3: the iterative solver reproduces the exact one to its tolerance on a three-substance scene."""
+    import world_scenes as ws
+    a, b = ws.watercolour(), ws.watercolour()
+    a.solver, b.solver = "exact", "iterative"
+    for dt in (0.1, 0.3, 0.3):
+        ra, rb = a.step(dt), b.step(dt)
+        assert rb.report["max solver residual"] <= 1e-8     # 10 x tolerance; a factorised fallback is at rounding
+    scale = np.max(a.q)
+    assert np.max(np.abs(a.q - b.q)) <= 1e-6 * scale
+    assert np.max(np.abs(a.ground.held - b.ground.held)) <= 1e-6 * max(np.max(a.ground.held), 1e-300)
+
+
+def test_advance_covers_the_duration_with_a_deterministic_rule():
+    a, b = watercolour(H=30, W=36), None
+    b = a.fork()
+    ra = a.advance(5.0)
+    rb = b.advance(5.0)
+    assert a.t == 5.0 and ra.report["steps"] > 1
+    assert ra.digest() == rb.digest() and a.digest() == b.digest()
+    check_energy(ra)
+    # it grows: a quiet film is covered in few steps
+    assert ra.report["steps"] < 5.0 / 1e-3
+
+
+def test_settle_retires_only_what_cannot_flow():
+    class Dry(Analytic):
+        def viscosity(self, film):
+            eta = np.full(film.shape, 1e-3)
+            hold = film.q[1] > 0                      # cells with the 'powder' and no water
+            eta = np.where(hold & (film.q[0] <= 0), np.inf, eta)
+            return Derived(eta, "assumed")
+    powder = Sub("powder", 2500.0)
+    H, W = 10, 10
+    q = np.zeros((2, H, W)); q[0, 2:5, 2:5] = 30 * um; q[1, 6:9, 6:9] = 5 * um
+    w = World(Dry((WATER, powder)), (WATER, powder), flat_ground(H, W), 0.25 * mm, q=q)
+    r = w.settle()
+    assert len(w.strata) == 1 and np.all(w.q[1] == 0) and np.array_equal(w.q[0], q[0])
+    assert r.residual["matter"] <= 1e-12 and r.residual["energy"] <= 1e-12
+    assert w.settle().entries == ()                   # nothing left that cannot flow

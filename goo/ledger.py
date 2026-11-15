@@ -6,7 +6,7 @@ import hashlib
 import numpy as np
 
 KINDS = ("matter", "energy", "light")
-FLAGS = ("impossible", "out_of_domain", "bounds_collapsed", "privilege", "reverse", "slope")
+FLAGS = ("impossible", "out_of_domain", "bounds_collapsed", "privilege", "reverse", "slope", "solver")
 
 
 @dataclass(frozen=True)

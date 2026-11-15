@@ -1,7 +1,7 @@
 """Substep 1: flow of the film's total volume, substances in donor proportions (DYNAMICS.md §4.1)."""
 import numpy as np
 import scipy.sparse as sp
-from scipy.sparse.linalg import splu
+from goo.world.linsolve import Factor, SolveFailed
 from goo.world.common import Reject, coeff, mixing, dF_grav, dF_cap, dF_wet, mu_wet
 from goo.world.grid import capillary_pressure
 
@@ -142,16 +142,17 @@ def flow(ctx, q, dt):
             r2 = capc[scells] - P.T @ (Ma * oa * G0)
             Afull = sp.bmat([[Asys, Bm], [Cr, Dr]], format="csc")
             bb = np.concatenate([rhs, r2])
-            lu = splu(Afull)
+            lu = Factor(Afull, ctx.solver, ctx.stats)
             sol = lu.solve(bb)
-            sol = sol + lu.solve(bb - Afull @ sol)               # one step of refinement
+            if lu.mode == "exact":
+                sol = sol + lu.solve(bb - Afull @ sol)           # one step of refinement
             dy, lam_s = sol[:nn], sol[nn:]
         else:
             Ac = Asys.tocsc()
             Ac.sort_indices()
             key = (Ac.shape, Ac.indptr.tobytes(), Ac.indices.tobytes(), Ac.data.tobytes())
             if cache.get("key") != key:                 # the same matrix bit for bit: the same factors
-                cache["key"], cache["lu"] = key, splu(Ac)
+                cache["key"], cache["lu"] = key, Factor(Ac, ctx.solver, ctx.stats)
             dy, lam_s = cache["lu"].solve(rhs), np.zeros(0)
         lam = np.zeros(N)
         lam[scells] = lam_s

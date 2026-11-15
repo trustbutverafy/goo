@@ -328,6 +328,39 @@ before and after and moved from `stored` to `frozen`: nothing is dropped. `add(a
 port: matter from `origin`, energy F(after) − F(before) from `work[origin]`. Changing the environment
 books its ΔF as `work[environment]`. `fork()` copies the state and both ledgers.
 
+## 9a. Solvers, advance, settle
+
+*Solvers* (SPEC §3). `exact` factorises every system (SuperLU) and is the reference: O3 by construction.
+`iterative` solves the same systems with GMRES, preconditioned by an incomplete LU, to a relative residual
+of 1e-10 within a fixed budget; a solve that misses it is factorised instead (counted as a fallback). The
+systems are assembled on the active set in canonical order, so the iterates are the same in a window and
+on the panel (O5, O6 hold, tested). D_num's sign holds to the tolerance; receipts report `max solver
+residual`, `solver iterations`, `solver fallbacks`; a negative D_num beyond rounding is flagged. Where a
+frozen choice of the step (a face's orientation, an entering amount kept or dropped) is decided on a number
+the solver knows only to its tolerance, the two solvers can take different admissible steps, which differ
+at O(dt), not at the tolerance (seen: 1.6e-4 of the film).
+
+*Single-substance cells in the local step* are not solved by Newton: their residual q' − q₀ + e(q') + a(q')
+is increasing in q' (the film's potential rises with q' under the convex split) and a(q') solves an
+increasing equation at fixed q', so both are bracketed and bisected to the last bits; the drain (h' = 0) is
+the case where the residual at 0 is still ≥ 0. (Newton oscillated on real water in cellulose, between filling
+the pores past what the film held and the one-way valve shutting.)
+
+*advance(duration)* covers world time with steps whose size follows the step's own error estimate,
+e = D_num(time)/energy moved (the Bregman divergence, O(dt²) per step): double after e ≤ tol/4, halve after
+e > tol (tol 1e-3), divide by the pieces after a halving. It reads only receipts, so it is the same in a
+window and on the panel.
+
+*settle()* retires every wet cell whose viscosity is +inf (no liquid left, or jammed particles): mobility is
+exactly zero there, so retiring loses no freedom. A film that still holds a liquid is not touched.
+
+*What the ground does, from the code.* Sorption acts in every wet cell with suction, whatever strata lie
+between the film and the ground: strata do not block it (a gap: a stratum's permeability is not described).
+Water held in the pores does not evaporate: exchange acts on the wet film only. There is no lateral transport
+in the pores: `held` changes only by vertical sorption. Particles are not sorbed (the map gives them no
+suction: filtered); as their liquid leaves, the film becomes particle-rich, its viscosity rises (Krieger) to
++inf at packing, and settle() retires it.
+
 ## 10. Cure and dissolution: not yet terms
 
 *Cure* does not fit the gradient structure with the maps as they are. `reactions(film, env)` gives a

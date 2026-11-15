@@ -4,6 +4,7 @@ from goo.world.common import Reject, coeff, mixing, dF_grav, dF_cap, dF_wet, dF_
 from goo.world.grid import capillary_pressure
 
 MAX_NEWTON = 80
+BISECT = 80         # halvings of a bracket: to the last bits of a double
 
 
 def local(ctx, q, held, dt):
@@ -90,7 +91,7 @@ def local(ctx, q, held, dt):
         return th, mup, Jp
 
     e = np.zeros((S, n)); av = np.zeros((S, n))
-    live = np.arange(n)
+    live = np.flatnonzero(~single)                 # single-substance cells are bracketed below
     I2 = np.eye(2 * S)
     for it in range(MAX_NEWTON):
         if live.size == 0:
@@ -129,8 +130,59 @@ def local(ctx, q, held, dt):
         live = idx[~done]
     else:
         raise Reject("local: Newton did not converge")
+    # single-substance cells: the residual q' - q0 + e(q') + a(q') is increasing in q' (the film's potential rises
+    # with q' under the convex split) and a(q') solves an increasing equation at fixed q', so both are bracketed and
+    # bisected (a fixed number of halvings, element-wise): the root, or the drain h' = 0 when the residual at 0 is
+    # still >= 0 (then the KKT split below applies)
+    sidx = np.flatnonzero(single)
+    drain = np.zeros(n, bool)
+    if sidx.size:
+        isub = np.argmax(q0[:, sidx] > 0, axis=0)
+        cols = np.arange(sidx.size)
+        T0 = q0[isub, sidx]
+        kE, kA = ke[isub, sidx] * Eon[isub, sidx], ks[isub, sidx] * Son[isub, sidx]
+
+        def mu_at(qv):
+            qq = np.zeros((S, sidx.size)); qq[isub, cols] = qv
+            return potentials(qq, sidx)[0][isub, cols]
+
+        def a_at(muv):
+            if not np.any(kA > 0) or C <= 0:
+                return np.zeros(sidx.size)
+            lo, hi = np.zeros(sidx.size), np.full(sidx.size, (C - w0[sidx]) * (1 - 1e-12))
+            for _ in range(BISECT):
+                mid = 0.5 * (lo + hi)
+                th = (w0[sidx] + mid) / C
+                g = mid - kA * np.maximum(muv - (-P[isub, sidx] + Pb[sidx] * th / (1 - th)), 0.0)
+                lo, hi = np.where(g < 0, mid, lo), np.where(g < 0, hi, mid)
+            return lo
+
+        def resid(qv):
+            muv = mu_at(qv)
+            ev = kE * (muv - menv[isub])
+            av_ = a_at(muv)
+            return qv - T0 + ev + av_, ev, av_
+        r0, e0, a0 = resid(np.zeros(sidx.size))
+        drain[sidx] = r0 >= 0
+        lo = np.zeros(sidx.size)
+        hi = T0.copy()
+        for _ in range(60):                                   # condensation can raise q' above q0: widen the bracket
+            rh = resid(hi)[0]
+            grow = (rh < 0) & ~drain[sidx]
+            if not grow.any():
+                break
+            hi = np.where(grow, 2 * hi + T0, hi)
+        for _ in range(BISECT):
+            mid = 0.5 * (lo + hi)
+            rm = resid(mid)[0]
+            lo, hi = np.where(rm < 0, mid, lo), np.where(rm < 0, hi, mid)
+        qs = np.where(drain[sidx], 0.0, hi)
+        _, es, as_ = resid(qs)
+        e[isub, sidx] = np.where(drain[sidx], 0.0, es)
+        av[isub, sidx] = np.where(drain[sidx], 0.0, as_)
+        # the update is q' = q0 - e - a, exactly in flux form
     q1 = q0 - e - av
-    drain = single & (q1.sum(0) < 0)
+    drain = drain & single
     if drain.any():
         for j in np.flatnonzero(drain):
             i = int(np.flatnonzero(q0[:, j] > 0)[0])

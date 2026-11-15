@@ -11,6 +11,7 @@ from goo.units import k_B
 from goo.world.flow import flow
 from goo.world.diffuse import diffuse
 from goo.world.local import local
+from goo.world.linsolve import SolveFailed, RTOL
 
 MAX_HALVINGS = 24
 
@@ -40,7 +41,10 @@ class World:
     clock and two ledgers. `constitutive` satisfies goo.world.Constitutive. q: [S, H, W] volume per area (m)."""
 
     def __init__(self, constitutive, substances, ground, dx, environment=None, q=None, strata=(),
-                 slope_bound=0.1, margin=3):
+                 slope_bound=0.1, margin=3, solver="exact"):
+        if solver not in ("exact", "iterative"):
+            raise ValueError("solver: 'exact' (factorising, the reference) or 'iterative' (SPEC §3)")
+        self.solver = solver
         self.con = constitutive
         self.substances = tuple(substances)
         S = len(self.substances)
@@ -164,7 +168,7 @@ class World:
                 return np.where(wL == wR, 0.5 * (gL + gR), np.where(wL, gL, gR))
             gx = face(gam[:, :-1], gam[:, 1:], wet[:, :-1], wet[:, 1:])
             gy = face(gam[:-1, :], gam[1:, :], wet[:-1, :], wet[1:, :])
-        wv = call(self.con, "wetting", film, self.ground, flags=flags)
+        wv = call(self.con, "wetting", film, self._ground_box(box), flags=flags)
         if wv is None:
             Sw, ell = np.zeros((hb, wb)), np.ones((hb, wb))
         else:
@@ -172,7 +176,7 @@ class World:
             if np.any(Sw > 0) or np.any((Sw != 0) & ~(ell > 0)):
                 raise ValueError("wetting: spreading coefficient must be <= 0 with a positive length")
             ell = np.where(ell > 0, ell, 1.0)
-        sv = call(self.con, "sorption", film, self.ground, flags=flags)
+        sv = call(self.con, "sorption", film, self._ground_box(box), flags=flags)
         S = len(self.substances)
         if sv is None or self.ground.capacity <= 0:
             P = np.zeros((S, hb, wb))
@@ -180,6 +184,12 @@ class World:
             P = np.array(np.broadcast_to(np.asarray(sv[0], np.float64), (S, hb, wb)))
         self._coef_flags = flags
         return dict(gx=gx, gy=gy, Sw=Sw, ell=ell, P=P, Pb=P.max(0) if S else np.zeros((hb, wb)))
+
+    def _ground_box(self, box):
+        """The ground on a box of the panel (views), for maps of (film, ground) evaluated on that box."""
+        g = self.ground
+        sl = _sl(box)
+        return Ground(g.z[sl[1:]], g.solid, g.porosity, g.pore_radius, g.depth, g.substances, g.held[sl])
 
     def _lag_box(self, box, lag=None):
         """The panel's lagged coefficients on a box (views)."""
@@ -251,7 +261,7 @@ class World:
                    None, None, None, 0.0, self.a, menv, has, [])
 
     # ---- the step ----------------------------------------------------------------------------------------
-    def step(self, dt, rate=None, window="auto"):
+    def step(self, dt, rate=None, window="auto", solver=None):
         """Advance by dt (s). rate: None, a scalar or an [H, W] field >= 0 multiplying every Psi* (SPEC §8).
         window: 'auto' (the wet cells' bounding box plus a margin) or 'panel'. Returns a Receipt. Its work is on
         the region R that can change (the window and what changed in the last step); F, the coefficients and the
@@ -265,6 +275,10 @@ class World:
         if np.any(r < 0):
             raise ValueError("rate < 0 reverses the world (SPEC §8, impossible); reverse steps are not implemented yet")
         self._own()
+        self._solver_now = self.solver if solver is None else solver
+        if self._solver_now not in ("exact", "iterative"):
+            raise ValueError("solver: 'exact' or 'iterative'")
+        self._stats = {}
         mm, me = self.matter.mark(), self.energy.mark()
         t0 = self.t
         flags = []
@@ -323,11 +337,64 @@ class World:
         ncell = 0 if R is None else (R[1] - R[0]) * (R[3] - R[2])
         res = self._residuals(acc["moved"] + abs(relabel), dF + relabel, sb, rnd, ncell)
         report = {f"D {k}": float(acc[k]) for k in MECHANISMS}
+        if self._solver_now == "iterative":
+            report["max solver residual"] = float(self._stats.get("solver residual", 0.0))
+            report["solver iterations"] = float(self._stats.get("solver iterations", 0))
+            report["solver tolerance"] = RTOL
+            report["solver fallbacks"] = float(self._stats.get("solver fallbacks", 0))
+            dn = acc["num_time"] + acc["num_transport"]
+            if dn < -1e-12 * max(acc["moved"], 1e-300):
+                flags.append(Flag("out_of_domain", "iterative solver",
+                                  "D_num negative beyond rounding: its sign holds only to the solver's tolerance", dn))
         report.update({"D_num time": float(acc["num_time"]), "D_num transport": float(acc["num_transport"]),
                        "energy moved": float(acc["moved"]), "max slope": sl, "pieces": acc["pieces"],
                        "rate integral": float(dt * np.sum(r) * self.dx ** 2)})
         return Receipt("step", t0, self.t, self.matter.since(mm) + self.energy.since(me), res,
                        {k: (Fb[k], Fa[k]) for k in TERMS}, tuple(flags), report)
+
+    ADVANCE_TOL = 1e-3          # D_num (time part) per step, as a share of the energy the step moved
+    ADVANCE_DT0 = 1e-3          # s: the first step when the world has no step-size history
+
+    def advance(self, duration, rate=None, solver=None, dt=None, tol=None):
+        """Cover `duration` seconds of world time with as many steps as needed; return the summed Receipt.
+
+        Step-size rule (deterministic: it reads only receipts, which are the same in a window and on the panel):
+        the time part of D_num is the Bregman divergence of the step, O(dt^2), so e = D_num time / energy moved
+        is its error estimate. After a step with e <= tol/4 and no halving the next dt doubles; with e > tol it
+        halves; a step that needed halvings is followed by dt / (its pieces). The last step lands on the end.
+        The size reached is kept for the next call."""
+        T = float(duration)
+        if not T > 0:
+            raise ValueError("duration must be positive")
+        tol = self.ADVANCE_TOL if tol is None else float(tol)
+        h = float(dt) if dt is not None else getattr(self, "_dt_next", self.ADVANCE_DT0)
+        t_end = self.t + T
+        total = None
+        nsteps = 0
+        while self.t < t_end:
+            left = t_end - self.t
+            take = min(h, left)
+            if left - take < 1e-9 * take:            # do not leave a sliver
+                take = left
+            r = self.step(take, rate=rate, solver=solver)
+            nsteps += 1
+            total = r if total is None else total + r
+            moved = r.report.get("energy moved", 0.0)
+            e = r.report.get("D_num time", 0.0) / moved if moved > 0 else 0.0
+            pieces = r.report.get("pieces", 1.0) or 1.0
+            if pieces > 1:
+                h = take / pieces
+            elif e > tol:
+                h = take / 2
+            elif e <= tol / 4 and take == h:
+                h = 2 * h
+            if self.t >= t_end or abs(self.t - t_end) <= 1e-12 * max(abs(t_end), 1.0):
+                self.t = t_end
+                break
+        self._dt_next = h
+        report = dict(total.report)
+        report["steps"] = float(nsteps)
+        return Receipt("advance", total.t0, self.t, total.entries, total.residual, total.F, total.flags, report)
 
     def _flags(self, pairs):
         seen, out = set(), []
@@ -356,7 +423,7 @@ class World:
     def _advance(self, dt, r, window, depth, ctxflags):
         try:
             return [self._piece(dt, r, window, ctxflags)]
-        except Reject:
+        except (Reject, SolveFailed):
             if depth >= MAX_HALVINGS:
                 raise RuntimeError(f"step could not be accepted after {MAX_HALVINGS} halvings")
             return self._advance(dt / 2, r, window, depth + 1, ctxflags) + self._advance(dt / 2, r, window, depth + 1, ctxflags)
@@ -399,12 +466,14 @@ class World:
         menv, has = self._mu_env()
         flags = []
         wetting, pores = self._has_wet, self._has_pore          # decided on the panel, so a window decides alike
-        ctx = Ctx(G, self.substances, self.rho, self.con, self.env, self.ground, flat(self._zb), flat(r),
+        ctx = Ctx(G, self.substances, self.rho, self.con, self.env, self._ground_box(win), flat(self._zb), flat(r),
                   panel_faces(c["gx"], c["gy"], y0, y1, x0, x1), flat(c["Sw"]) if wetting else None,
                   flat(c["ell"]) if wetting else None, flat(c["P"]) if pores else None,
-                  flat(c["Pb"]) if pores else None, self.ground.capacity, self.a, menv, has, flags)
+                  flat(c["Pb"]) if pores else None, self.ground.capacity, self.a, menv, has, flags,
+                  self._solver_now, {})
         q = flat(self.q).copy()
         held = flat(self.ground.held).copy()
+        pst = ctx.stats
         q1, fr = flow(ctx, q, dt)
         q2, dr = diffuse(ctx, q1, dt)
         q3, held3, lr = local(ctx, q2, held, dt)
@@ -412,6 +481,8 @@ class World:
         self.q[:, y0:y1, x0:x1] = q3.reshape(S, Hh, Ww)
         self.ground.held[:, y0:y1, x0:x1] = held3.reshape(S, Hh, Ww)
         ctxflags.extend(flags)
+        for k, v in pst.items():                    # only an accepted piece's solves count
+            self._stats[k] = max(self._stats.get(k, 0.0), v) if k == "solver residual" else self._stats.get(k, 0) + v
         rep["viscous"], rep["plastic"] = fr["D_viscous"], fr["D_plastic"]
         rep["diffusion"] = dr["D_diffusion"]
         rep["exchange"], rep["sorption"] = lr["D_exchange"], lr["D_sorption"]
@@ -530,6 +601,25 @@ class World:
         return Receipt("retire", t, t, self.matter.since(mm) + self.energy.since(me),
                        self._residuals(abs(d), d, sb, mag, self._ncells(self._box_of(moved.sum(0) > 0))),
                        {kk: (Fb[kk], Fa[kk]) for kk in TERMS}, ())
+
+    def settle(self):
+        """Retire, as a law, every wet cell whose film can no longer flow: its viscosity is +inf (no liquid left,
+        or particles jammed), so its mobility is exactly zero and it has no lateral freedom left to lose. All of
+        such a cell's matter becomes one new stratum (SPEC §6). A film that still holds a liquid is left as it is,
+        however slow. Returns the retirement's Receipt (an empty one if nothing settles)."""
+        wet = self.q.sum(0) > 0
+        box = self._box_of(wet)
+        t = self.t
+        if box is None:
+            return Receipt("settle", t, t)
+        flags = []
+        eta = call(self.con, "viscosity", Film(self.substances, self.q[_sl(box)]), flags=flags)
+        stuck = np.zeros((self.H, self.W), bool)
+        stuck[_sl(box)[1:]] = np.isposinf(np.asarray(eta, np.float64)) & wet[_sl(box)[1:]]
+        if not stuck.any():
+            return Receipt("settle", t, t)
+        r = self.retire(mask=stuck)
+        return Receipt("settle", r.t0, r.t1, r.entries, r.residual, r.F, r.flags + tuple(self._flags([])), r.report)
 
     def set_environment(self, environment):
         """Change the reservoirs: an act whose ΔF is work by the environment's port. It changes F everywhere, so
