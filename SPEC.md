@@ -100,7 +100,12 @@ D_num   ≥ 0     the remainder: what the discretisation dissipates beyond the m
 ```
 
 `D_num ≥ 0` must follow from the construction of the step for admissible substances, with the
-argument written in `docs/DYNAMICS.md`. In arithmetic it is at least −1e-12 of the energy moved. It
+argument written in `docs/DYNAMICS.md`. In arithmetic it is at least −1e-12 of the energy moved.
+That is the `exact` solver, which factorises its systems and is the reference. A world may instead
+step with the `iterative` solver, which solves the same systems to a stated tolerance by a
+deterministic rule: O1, O2, O5 and O6 hold as before, the sign of `D_num` holds only to that
+tolerance, every receipt reports the solver's residual, and a step whose `D_num` is negative beyond
+rounding is flagged. Tests compare the two. It
 is booked to `dissipated[numerical]` and reported per step in two parts: one from the time step,
 which must fall at the scheme's stated order as `dt` is refined, and one from transport on the grid
 (numerical mixing), which must fall as `dx` is refined. A coefficient of F that the step holds fixed
@@ -132,7 +137,7 @@ morph          morphology, or none for a continuous phase       size distributio
 rho            density
 thermo         its terms in the free energy                     volatility, surface tension, interactions, wetting
 rheo           its terms in the dissipation potential           viscosity, packing, yield, mobility
-reactions      what it becomes, with stoichiometry by mass      cure, coalescence, dissolution
+reactions      what it becomes: stoichiometry by mass, a free energy of reaction, a rate   cure, coalescence, dissolution
 reservoir      finite energy an impossible substance may draw   0 for every admissible substance
 prov           provenance of each field
 ```
@@ -257,10 +262,11 @@ O8  exact limits   with a term's parameter at zero the result is bit-identical t
 The derivation comes before the code: `docs/DYNAMICS.md` writes F and Ψ* for the first terms, the
 discrete step, and the argument for O1 to O4.
 
-**Retirement.** Turning part of the wet film into a stratum retires degrees of freedom. The matter
-moves from `wet` to `stratum[k]`, the free energy it still holds moves from `stored` to `frozen`,
-and nothing is dropped. Whether a stratum later gives matter back to a liquid above
-it is decided by the dissolution term, from descriptions.
+**Retirement.** Turning part of the wet film into a stratum retires its lateral degrees of freedom:
+it can no longer flow. The matter moves from `wet` to `stratum[k]`, the free energy it still holds
+moves from `stored` to `frozen`, and nothing is dropped. A stratum is not thermodynamically dead:
+the potentials of the top stratum's substances stay in F, and whether it gives matter back to a
+liquid above it is decided by the dissolution term, from descriptions.
 
 ## 7. Light
 
@@ -310,7 +316,7 @@ blade; a porous brush, which gives or takes according to its retention curve; an
 tape, which is a wall. The environment is a set of reservoirs at fixed potential: humidity, oxygen,
 temperature, gravity, illumination. Changing one is an act with a receipt. A reservoir's activity is
 positive: at activity zero it would take matter at unbounded gain of free energy. A substance the
-atmosphere neither holds nor takes is left out.
+atmosphere neither holds nor takes is left out, and its exchange coefficient is zero.
 
 **Clocks.** The painter may scale the world's rates by a field `r(x, t)` that multiplies `Ψ*`.
 
@@ -365,8 +371,10 @@ K0  units, evidence, ledger, film                                             do
     substances into the world                                                 a 6 x 6 world of water on cellulose closes its ledgers through
                                                                               test-side shims (tests/substance/test_world_protocol.py); wetting left out
 K1  docs/DYNAMICS.md; the step with O1 to O8 on the first terms              built; owner's tests pass against analytic laws (tests/world/); not yet refereed
-    owed: cure and dissolution (xfail); no real substance has been through the step; surface tension is
-    lagged (no Marangoni stress); a step on 256² cells takes 5 to 23 s
+    real substances through the step, with wetting and sorption, no shims     tested on a 6 x 6 world (tests/substance/test_world_protocol.py)
+    owed: the iterative solver (the exact one takes 3 s a step at 25,000 active cells of water, 36 s at 113,000,
+    and fails on three substances at that size); cure (needs the reaction's free energy) and dissolution (xfail);
+    surface tension is lagged (no Marangoni stress)
 K2  light on the first rung with G1 to G7                                    built; owner's tests pass (tests/light/); not yet refereed
 K3  ports, the first bodies, journal, replay, clocks                         not begun
 K4  the lab and observers                                                    built; owner's tests pass (tests/lab/, tests/observe/); not yet refereed
