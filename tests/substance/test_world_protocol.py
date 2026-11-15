@@ -176,43 +176,14 @@ def test_wetting_and_sorption():
 
 # ----------------------------------------------------------------------------------------------- a tiny world
 def _world_inputs(without=()):
-    """(constitutive, environment) for goo.world as it stands in this copy. When goo.world reads exchange's
-    (k, mu_env, activity) and goo.film.Environment (the dynamics owner's change in progress), these are maps itself
-    and goo.film.Environment; until then a two-line shim gives the world exchange's k and the potentials."""
-    from goo.world import protocol
+    """(constitutive, environment) for goo.world: the maps themselves and a goo.film.Environment. `without`
+    leaves functions out of the protocol (an absent function is an absent term)."""
     env = FilmEnvironment(activity={"water": 0.5})
-    native = "activity" in getattr(protocol.Environment, "__dataclass_fields__", {})
 
     class Without:
         def __getattr__(self, name):
             return None if name in without else getattr(maps, name)
-    if native:
-        return (Without() if without else maps), env
-
-    class Shim:
-        def __getattr__(self, name):
-            return None if name in without else getattr(maps, name)
-
-        def yield_stress(self, film):                      # the world will collapse the bound itself
-            return maps.yield_stress(film).collapse("lo")[0]
-
-        def exchange(self, film, e):
-            d = maps.exchange(film, e)
-            return Derived(d.value.k, d.evidence, d.in_domain, d.map)
-
-    from dataclasses import dataclass, field
-
-    @dataclass(frozen=True)
-    class Env:
-        T: float
-        gravity: tuple
-        activity: dict
-        boundary_layer: float
-        potentials: dict
-
-    probe = Film.uniform({L.WATER: 1 * um})
-    mu_env = maps.exchange(probe, env).value.mu_env
-    return Shim(), Env(env.T, env.gravity, dict(env.activity), env.boundary_layer, {"water": float(mu_env[0])})
+    return (Without() if without else maps), env
 
 
 def _tiny(without=()):
@@ -226,8 +197,8 @@ def _tiny(without=()):
 
 
 def test_a_tiny_world_of_water_on_cellulose():
-    """Water on a cellulose ground at 50 % humidity, every function of the protocol but wetting (see the xfail
-    below): the receipts close, every dissipation is non-negative, water leaves to the air and into the pores."""
+    """Water on a cellulose ground at 50 % humidity, every function of the protocol but wetting (the next
+    test adds it): the receipts close, every dissipation is non-negative, water leaves to the air and into the pores."""
     w, q, dx = _tiny(without=("wetting",))
     m0 = L.WATER.rho * q.sum() * dx * dx
     out = pores = 0.0
@@ -235,9 +206,9 @@ def test_a_tiny_world_of_water_on_cellulose():
         r = w.step(1e-3)
         assert r.residual["matter"] <= 1e-12
         assert r.residual["energy"] <= 1e-9
-        for k in ("viscous", "plastic", "diffusion", "exchange", "sorption"):
+        for k in [k for k in r.report if k.startswith("D ")]:
             assert r.report[k] >= 0.0, k
-        assert r.report["num_time"] >= -1e-12 * max(r.report["moved"], 1e-300)
+        assert r.report["D_num time"] >= -1e-12 * max(r.report["energy moved"], 1e-300)
         out += r.moved("matter", dst="reservoir[atmosphere]")
         pores += r.moved("matter", dst="ground")
     assert out > 0 and pores > 0
@@ -245,9 +216,6 @@ def test_a_tiny_world_of_water_on_cellulose():
     assert L.WATER.rho * w.q.sum() * dx * dx == pytest.approx(m0 - out - pores, rel=1e-10)
 
 
-@pytest.mark.xfail(reason="goo.world's dF_wet computes exp(-h0/ell) * -expm1(-dh/ell), which is 0 * inf = nan when "
-                          "ell is molecular (0.3 nm here, from the Hamaker constant) and a cell drains by more than "
-                          "~700 ell; reported to the lead (the world's arithmetic, not this map)", strict=True)
 def test_a_tiny_world_with_wetting():
     w, q, dx = _tiny()
     for _ in range(2):

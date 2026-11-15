@@ -3,7 +3,7 @@ the increments of F's terms (computed from increments, not differences of totals
 from dataclasses import dataclass
 import numpy as np
 from goo.film import Film
-from goo.world.protocol import call
+from goo.world.protocol import call, Mixing
 
 
 class Reject(Exception):
@@ -49,7 +49,11 @@ def coeff(ctx, name, q, cells, *extra):
     if v is None:
         return None
     if isinstance(v, tuple):
-        return tuple(np.asarray(x, np.float64).reshape(np.asarray(x).shape[:-2] + (-1,)) for x in v)
+        out = []
+        for x in v:
+            x = np.asarray(x, np.float64)
+            out.append(x.reshape(x.shape[:-2] + (-1,)) if x.ndim >= 2 else x)
+        return tuple(out)
     v = np.asarray(v, np.float64)
     return v.reshape(v.shape[:-2] + (-1,))
 
@@ -66,6 +70,8 @@ def mixing(ctx, qc):
         mx = unwrap(fn(Film(ctx.substances, qc[:, None, :]), ctx.env.T), "mixing", ctx.flags)
     if mx is None:
         return None
+    if not hasattr(mx, "f"):
+        mx = Mixing(*mx)
     present = qc > 0
     wet = qc.sum(0) > 0
     f = np.where(wet, np.asarray(mx.f, np.float64).reshape(n), 0.0)
@@ -97,10 +103,13 @@ def dF_cap(ctx, faces, h0, dh):
 
 
 def dF_wet(ctx, cells, h0, dh):
+    """Increment of F_wet = sum (-S)(1 - exp(-h/ell)) for a change dh, finite for any ell > 0: written as
+    sign(dh) (-S) exp(-min(h, h')/ell) (1 - exp(-|dh|/ell)), so a molecular ell and a large dh give 0, not 0 * inf."""
     if ctx.Swet is None:
         return 0.0
     S, l = ctx.Swet[cells], ctx.ell[cells]
-    per = (-S) * np.exp(-h0 / l) * (-np.expm1(-dh / l))
+    lo = np.minimum(h0, h0 + dh)
+    per = np.sign(dh) * (-S) * np.exp(-lo / l) * (-np.expm1(-np.abs(dh) / l))
     return ctx.grid.dx ** 2 * np.sum(per)
 
 

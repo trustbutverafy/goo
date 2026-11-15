@@ -26,8 +26,9 @@ class Analytic:
     m^2/(Pa s); k: exchange rate m/(Pa s); wet: (S, ell); sorb: (P per substance, kappa per substance)."""
 
     def __init__(self, substances, eta=1 * mPa_s, tau=None, gamma=72 * mN / m, kT_v=None, Lam=None, k=None,
-                 wet=None, sorb=None):
+                 wet=None, sorb=None, kT_v_env=None):
         self.subs = tuple(substances)
+        self.kT_v_env = KT_V_SMALL if kT_v_env is None else kT_v_env
         self.eta, self.tau_, self.gamma = eta, tau, gamma
         self.kT_v, self.Lam, self.k, self.wet, self.sorb = kT_v, Lam, k, wet, sorb
         for name, val in (("yield_stress", tau), ("surface_tension", gamma), ("mixing", kT_v), ("mobility", Lam),
@@ -66,7 +67,14 @@ class Analytic:
         return _d(np.broadcast_to(self._vec(self.Lam, film)[:, None, None], film.q.shape).copy(), "constant mobility")
 
     def exchange(self, film, env):
-        return _d(np.broadcast_to(self._vec(self.k, film)[:, None, None], film.q.shape).copy(), "constant exchange")
+        """(k, mu_env, activity): mu_env = (k_B T / v) ln a_env for every substance the environment names (v from
+        kT_v_env, a small molecule's by default), nan for the others; the film's activity is not used here."""
+        k = np.broadcast_to(self._vec(self.k, film)[:, None, None], film.q.shape).copy()
+        c = self._vec(self.kT_v_env, film)
+        act = dict(env.activity)
+        with np.errstate(divide="ignore"):
+            mu = np.array([c[i] * np.log(act[s.name]) if s.name in act else np.nan for i, s in enumerate(film.substances)])
+        return (_d(k, "constant exchange"), _d(mu, "ideal vapour reservoir"), _d(np.zeros(film.q.shape), "unused"))
 
     def wetting(self, film, ground):
         S, l = self.wet

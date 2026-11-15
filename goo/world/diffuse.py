@@ -4,7 +4,9 @@ import scipy.sparse as sp
 from scipy.sparse.linalg import splu
 from goo.world.common import Reject, coeff, mixing, dF_grav, dF_cap, dF_wet, dF_exch
 
-MAX_NEWTON = 80
+MAX_NEWTON = 60
+LOG_STEP = 300.0     # largest fall of ln q in one iteration (keeps amounts representable)
+LOG_RISE = 2.0       # largest rise of ln q in one iteration (a damping)
 ENTRY_PECLET = 30.0  # a substance does not enter a cell where its equilibrium share would be below exp(-30) of
                      # its donor's: such amounts are not representable against the fluxes that balance them
 START = 1e-3          # first Newton iterate, as a fraction of the neighbour's, for a substance entering a cell (not physics:
@@ -114,7 +116,11 @@ def diffuse(ctx, q, dt):
         with np.errstate(divide="ignore", invalid="ignore"):
             Xb = np.where(W > 0, (omg * X).sum(0) / W, 0.0)
         j = omg * (X - Xb)
-        upn = np.where(omg > 0, (X - Xb) >= 0, up)
+        # a direction changes only where the relative force is clear of rounding (where it is not, the flux is
+        # rounding too, and either donor is an admissible mobility)
+        fscale = np.max(np.where(on, np.abs(mu[:, iL]) + np.abs(mu[:, iR]), 0.0), axis=0, keepdims=True) / dx
+        clear = np.abs(X - Xb) > 1e-12 * fscale        # the rounding of a difference of potentials of this size
+        upn = np.where((omg > 0) & clear, (X - Xb) >= 0, up)
         dv = np.empty((S, n))
         for i in range(S):
             dv[i] = np.bincount(iL, j[i], n) - np.bincount(iR, j[i], n)
@@ -122,43 +128,72 @@ def diffuse(ctx, q, dt):
 
     c = dt / dx ** 2
     up = None
+    lu, lu_up, prev = None, None, np.inf
+    best = np.inf
+    hmax = float(hc.max())
     for it in range(MAX_NEWTON):
         mx, X, j, dv, omg, W, Xb, up, upn = state(qp, up)
         R = qp - q0 + (dt / dx) * dv
-        H = mx[2]
-        with np.errstate(divide="ignore", invalid="ignore"):
-            Lf = np.where(W > 0, omg[:, None, :] * (np.eye(S)[:, :, None] - omg[None, :, :] / W), 0.0)
-            # d j_i / d omega_m, times d omega_m / d q'_m(donor) = kappa_m / h(donor)
-            dJw = np.where(W > 0, np.eye(S)[:, :, None] * (X - Xb)[:, None, :] - omg[:, None, :] * (X - Xb)[None, :, :] / W, 0.0)
-        dlam = kap / np.where(up, hc[iL], hc[iR])                     # [S, nf]
-        don = np.where(up, iL, iR)                                     # donor cell of m on f, [S, nf]
-        LHL = np.einsum("ikf,klf->ilf", Lf, H[:, :, iL])
-        LHR = np.einsum("ikf,klf->ilf", Lf, H[:, :, iR])
-        blocks = [(iL, iL, c * LHL), (iL, iR, -c * LHR), (iR, iL, -c * LHL), (iR, iR, c * LHR)]
-        rows, cols, vals = [], [], []
-        for rc, cc, blk in blocks:
-            for i in range(S):
-                for l in range(S):
-                    ru, cu = unk[i, rc], unk[l, cc]
-                    ok = (ru >= 0) & (cu >= 0)
-                    rows.append(ru[ok]); cols.append(cu[ok]); vals.append(blk[i, l][ok])
-        for sgn, rc in ((1.0, iL), (-1.0, iR)):
-            for i in range(S):
-                for mm in range(S):
-                    ru, cu = unk[i, rc], unk[mm, don[mm]]
-                    v = sgn * (dt / dx) * dJw[i, mm] * dlam[mm]
-                    ok = (ru >= 0) & (cu >= 0) & (v != 0)
-                    rows.append(ru[ok]); cols.append(cu[ok]); vals.append(v[ok])
-        J = sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(nu, nu))
-        J = (J + sp.identity(nu, format="csr")).tocsc()
-        d = splu(J).solve(-R[pi, pj])
+        r = R[pi, pj]
+        if it == 0 and not np.any(r) and np.array_equal(upn, up):
+            break                                      # exactly at rest: nothing to solve
+        rn = float(np.max(np.abs(r)))
+        # chord Newton: keep the factors of the last Jacobian while the residual falls at least tenfold per
+        # iteration and the upwind directions are those it was built with; otherwise refactor
+        if lu is None or not np.array_equal(up, lu_up) or rn > 0.1 * prev:
+            lu, lu_up = splu(_jacobian(S, n, nu, unk, iL, iR, up, kap, hc, mx[2], omg, W, X, Xb, c, dt, dx)), up.copy()
+        prev = rn
+        d = lu.solve(-r)
         dq = np.zeros((S, n)); dq[pi, pj] = d
-        lim = dq < -0.9 * qp                         # an amount falls at most tenfold per iteration (stays > 0)
-        qp = qp + np.where(lim, -0.9 * qp, dq)
+        # Newton in u = ln q: the Jacobian in u is J diag(q), so du = dq / q with the same factors; amounts stay
+        # positive and may fall by many decades in one iteration. A rise is capped at e^LOG_RISE per iteration.
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            du = np.where(act & (qp > 0), np.clip(dq / qp, -LOG_STEP, LOG_RISE), 0.0)
+        # backtracking on the residual (deterministic: halve the step up to 6 times, keep the best)
+        alpha, qn_ = 1.0, None
+        for _ls in range(7):
+            trial = qp * np.exp(alpha * du)
+            st = state(trial, up)
+            rt = float(np.max(np.abs((trial - q0 + (dt / dx) * st[3])[pi, pj])))
+            if qn_ is None or rt < r_best:
+                qn_, r_best = trial, rt
+            if rt <= (1 - 1e-4 * alpha) * rn or rn <= 1e-15 * hmax:
+                break                                  # sufficient decrease, or already at the rounding of h
+            alpha *= 0.5
+        change = qn_ - qp
+        qp = qn_
+        # an entering amount whose iterate falls below exp(-ENTRY_PECLET) of the cell gets no inflow: it is not
+        # represented (as the entry rule says), its faces carry none of it this step, and the system is rebuilt
+        dead = act & (q0 <= 0) & (qp < np.exp(-ENTRY_PECLET) * hc[None, :])
+        if dead.any():
+            qp[dead] = 0.0
+            for i in range(S):
+                dc = np.flatnonzero(dead[i])
+                if dc.size:
+                    hit = np.isin(iL, dc) | np.isin(iR, dc)
+                    kap[i, hit] = 0.0
+            on = kap > 0
+            act = np.zeros((S, n), bool)
+            for i in range(S):
+                act[i, iL[on[i]]] = True; act[i, iR[on[i]]] = True
+            act &= (qp > 0) | (q0 > 0)
+            unk = np.full((S, n), -1)
+            flat = np.flatnonzero(act.T.ravel())
+            pj, pi = flat // S, flat % S
+            unk[pi, pj] = np.arange(flat.size)
+            nu = flat.size
+            lu, best = None, np.inf
+            up = None
+            continue
         same = np.array_equal(upn, up)
         up = upn
-        if same and not lim.any() and np.all(np.abs(dq) <= 1e-12 * qp + 1e-14 * hc):
-            break
+        if same and np.all(np.abs(change) <= 1e-12 * qp + 1e-14 * hc):
+            fin = state(qp, up)
+            if np.all(q0 - (dt / dx) * fin[3] >= 0):
+                break                                  # converged, and the flux-form update is non-negative
+        if it >= 20 and rn > 0.5 * best and rn > 1e-14 * hmax:
+            raise Reject("diffusion: Newton stagnates")
+        best = min(best, rn)
     else:
         raise Reject("diffusion: Newton did not converge")
     mx, X, j, dv, omg, W, Xb, up, upn = state(qp, up)
@@ -177,3 +212,31 @@ def diffuse(ctx, q, dt):
         Dm = np.where(W > 0, 0.5 * np.sum(omg[:, None, :] * omg[None, :, :] * dX * dX, axis=(0, 1)) / W, 0.0)
     rep.update(D_diffusion=dt * dx ** 2 * np.sum(Dm), dF=dF, cells=cells)
     return qn, rep
+
+
+def _jacobian(S, n, nu, unk, iL, iR, up, kap, hc, H, omg, W, X, Xb, c, dt, dx):
+    with np.errstate(divide="ignore", invalid="ignore"):
+        Lf = np.where(W > 0, omg[:, None, :] * (np.eye(S)[:, :, None] - omg[None, :, :] / W), 0.0)
+        # d j_i / d omega_m, times d omega_m / d q'_m(donor) = kappa_m / h(donor)
+        dJw = np.where(W > 0, np.eye(S)[:, :, None] * (X - Xb)[:, None, :] - omg[:, None, :] * (X - Xb)[None, :, :] / W, 0.0)
+    dlam = kap / np.where(up, hc[iL], hc[iR])                     # [S, nf]
+    don = np.where(up, iL, iR)                                     # donor cell of m on f, [S, nf]
+    LHL = np.einsum("ikf,klf->ilf", Lf, H[:, :, iL])
+    LHR = np.einsum("ikf,klf->ilf", Lf, H[:, :, iR])
+    blocks = [(iL, iL, c * LHL), (iL, iR, -c * LHR), (iR, iL, -c * LHL), (iR, iR, c * LHR)]
+    rows, cols, vals = [], [], []
+    for rc, cc, blk in blocks:
+        for i in range(S):
+            for l in range(S):
+                ru, cu = unk[i, rc], unk[l, cc]
+                ok = (ru >= 0) & (cu >= 0)
+                rows.append(ru[ok]); cols.append(cu[ok]); vals.append(blk[i, l][ok])
+    for sgn, rc in ((1.0, iL), (-1.0, iR)):
+        for i in range(S):
+            for mm in range(S):
+                ru, cu = unk[i, rc], unk[mm, don[mm]]
+                v = sgn * (dt / dx) * dJw[i, mm] * dlam[mm]
+                ok = (ru >= 0) & (cu >= 0) & (v != 0)
+                rows.append(ru[ok]); cols.append(cu[ok]); vals.append(v[ok])
+    J = sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(nu, nu))
+    return (J + sp.identity(nu, format="csr")).tocsc()

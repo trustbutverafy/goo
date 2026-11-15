@@ -40,7 +40,7 @@ def test_O2_positivity_under_drying_draining_and_steep_fronts():
     g = flat_ground(H, W, porosity=0.4, depth=30 * um, z=z)
     q = blobs(H, W, [(5, 5), (10, 10)], 3, [(60 * um,), (30 * um,)])
     con = Analytic((WATER,), eta=ETA_W, gamma=GAM_W, k=3e-14, sorb=(3e4, 5e-15), wet=(-5e-3, 1 * um))
-    w = World(con, (WATER,), g, dx, Environment(gravity=(2.0, 5.0, 8.0), potentials={"water": KT_V_SMALL * np.log(0.3)}), q=q)
+    w = World(con, (WATER,), g, dx, Environment(gravity=(2.0, 5.0, 8.0), activity={"water": 0.3}), q=q)
     dried = False
     for _ in range(40):
         w.step(0.5)
@@ -60,8 +60,8 @@ def test_O3_energy_identity_and_signs_watercolour():
     for _ in range(8):
         r = w.step(0.25)
         check_energy(r)
-        assert r.report["num_transport"] >= -1e-12 * r.report["moved"]
-        assert r.report["num_time"] >= -1e-12 * r.report["moved"]
+        assert r.report["D_num transport"] >= -1e-12 * r.report["energy moved"]
+        assert r.report["D_num time"] >= -1e-12 * r.report["energy moved"]
 
 
 def test_O3_energy_bingham_wetting_tilt_and_two_densities():
@@ -76,7 +76,7 @@ def test_O3_energy_bingham_wetting_tilt_and_two_densities():
     for dt in (0.5, 2.0, 8.0, 30.0):
         r = w.step(dt)
         check_energy(r)
-        plastic += r.report["plastic"]
+        plastic += r.report["D plastic"]
     assert plastic > 0
 
 
@@ -84,7 +84,7 @@ def test_O3_add_and_environment_are_work():
     w = watercolour()
     w.step(0.2)
     F0 = sum(w.F().values())
-    r = w.set_environment(Environment(gravity=w.env.gravity, potentials={"water": KT_V_SMALL * np.log(0.9)}))
+    r = w.set_environment(Environment(gravity=w.env.gravity, activity={"water": 0.9}))
     assert np.isclose(float(r.moved("energy", src="work[environment]")), sum(w.F().values()) - F0, rtol=1e-12)
     assert np.isclose(float(w.energy.balance("stored")), sum(w.F().values()), rtol=1e-12)
 
@@ -98,8 +98,8 @@ def test_O3_D_num_is_the_bregman_divergence_for_a_quadratic_F():
     for n in (1, 2, 4, 8):
         w = w0.fork()
         r = w.step(0.02 / lam / n)
-        vals.append(r.report["num_time"] / (0.02 / lam / n) ** 2)
-        assert r.report["num_time"] > 0
+        vals.append(r.report["D_num time"] / (0.02 / lam / n) ** 2)
+        assert r.report["D_num time"] > 0
     assert np.allclose(vals, vals[-1], rtol=0.05)
 
 
@@ -113,7 +113,7 @@ def test_O4_rest_states_do_not_move(case):
         w = World(con, (WATER,), flat_ground(H, W), dx, q=np.full((1, H, W), 40 * um))
     elif case == "bare panel":
         con = Analytic((WATER,), k=1e-15)
-        w = World(con, (WATER,), flat_ground(H, W, 0.3, 50 * um), dx, Environment(potentials={"water": -1e8}))
+        w = World(con, (WATER,), flat_ground(H, W, 0.3, 50 * um), dx, Environment(activity={"water": 0.45}))
     elif case == "uniform mixture":
         a, b = Sub("a", 1000.0), Sub("b", 1200.0)
         con = Analytic((a, b), kT_v=KT_V_SMALL, Lam=1e-17)
@@ -128,7 +128,7 @@ def test_O4_rest_states_do_not_move(case):
         r = w.step(1.0, rate=rate)
     for a, b in zip(_all_amounts(w), before):
         assert np.array_equal(a, b)
-    assert r.report["moved"] == 0.0
+    assert r.report["energy moved"] == 0.0
 
 
 # ---- O5 locality --------------------------------------------------------------------------------------------
@@ -217,7 +217,7 @@ def test_O7_newtonian_ripple_first_order_in_dt_and_D_num_falls_first_order():
         w = w0.fork()
         D = 0.0
         for _ in range(n):
-            D += w.step(T / n).report["num_time"]
+            D += w.step(T / n).report["D_num time"]
         errs.append(abs(_amp(w) / A0 - np.exp(-lam_d * T)))
         dnum.append(D)
     eo = np.log2(np.array(errs[:-1]) / np.array(errs[1:]))
@@ -290,7 +290,7 @@ def test_O7_evaporation_into_a_fixed_atmosphere_then_exact_drain():
     H = W = 3
     k_ex, mu_env, h0 = 1e-15, KT_V_SMALL * np.log(0.5), 20 * um
     con = Analytic((WATER,), eta=ETA_W, gamma=GAM_W, k=k_ex)
-    env = Environment(gravity=(0, 0, g_0), potentials={"water": mu_env})
+    env = Environment(gravity=(0, 0, g_0), activity={"water": 0.5})
     w = World(con, (WATER,), flat_ground(H, W), 1 * mm, env, q=np.full((1, H, W), h0))
     a = k_ex * RHO_W * g_0
     h_inf = mu_env / (RHO_W * g_0)
@@ -323,7 +323,7 @@ def test_O8_a_term_at_zero_is_bit_identical_to_the_world_without_it(term, zero, 
     a, b = Sub("a", 1000.0), Sub("b", 1300.0)
     q = blobs(H, W, [(6, 6), (8, 10)], 3, [(40 * um, 5 * um), (30 * um, 0.0)])
     base = dict(eta=ETA_W, gamma=GAM_W, kT_v=KT_V_SMALL, Lam=1e-17, k=1e-15, wet=(-1e-3, 1 * um), sorb=(1e4, 1e-15))
-    env = Environment(gravity=(0, 2.0, g_0), potentials={"a": KT_V_SMALL * np.log(0.5)})
+    env = Environment(gravity=(0, 2.0, g_0), activity={"a": 0.5})
     worlds = []
     for over in (zero, absent):
         kw = dict(base); kw.update(over)

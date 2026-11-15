@@ -14,14 +14,16 @@ everywhere is treated exactly as absent (SPEC §6, O8). See docs/DYNAMICS.md for
     surface_tension(film)    gamma [H,W]      J/m^2      lagged per step
     mixing(film, T)          Mixing           J/m^2, J/m^3, J/m^4   f homogeneous of degree 1 in q
     mobility(film)           Lambda [S,H,W]   m^2/(Pa s) = D v/(k_B T), the Stokes mobility (Stokes-Einstein)
-    exchange(film, env)      k [S,H,W]        m/(Pa s)   rate coefficient against env.potentials; 0: not volatile
+    exchange(film, env)      (k [S,H,W] m/(Pa s), mu_env [S] J/m^3, activity [S,H,W])   k = 0: not volatile;
+                             mu_env: the reservoir's potential (the map turns env.activity into it)
     wetting(film, ground)    (S, ell) [H,W]   J/m^2, m   spreading coefficient S <= 0; wetting length ell > 0
     sorption(film, ground)   (P, kappa) [S,H,W]  Pa, m/(Pa s)   suction into the ground's pores; rate
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 import numpy as np
-from goo.evidence import Derived
+from goo.evidence import Derived, Bounded
+from goo.film import Environment          # the environment type (SPEC §5); re-exported
 
 
 @dataclass(frozen=True)
@@ -42,33 +44,25 @@ class Constitutive(Protocol):
     def viscosity(self, film) -> Derived: ...
 
 
-@dataclass(frozen=True)
-class Environment:
-    """Reservoirs at fixed potential. T in K. gravity (g_x, g_y, g_n) in m/s^2: g_x along columns, g_y down
-    rows, g_n >= 0 pressing the film onto the panel. potentials: substance name -> mu (J/m^3 of substance)
-    of the atmosphere (k_B T / v ln a for a volatile at activity a)."""
-    T: float = 293.15
-    gravity: tuple = (0.0, 0.0, 9.80665)
-    potentials: dict = field(default_factory=dict)
-
-    def __post_init__(self):
-        g = tuple(float(x) for x in self.gravity)
-        if len(g) != 3:
-            raise ValueError("gravity: (g_x, g_y, g_n)")
-        if g[2] < 0:
-            raise ValueError("g_n < 0 (a film under a ceiling) is Rayleigh-Taylor unstable and not on this rung")
-        object.__setattr__(self, "gravity", g)
-        object.__setattr__(self, "potentials", dict(self.potentials))
-
-
 def unwrap(v, name, flags):
-    """(array, evidence) of a map's answer; records out-of-domain use in `flags` (a list of (map, detail))."""
+    """The value of a map's answer as arrays. Derived: its value, flagging out-of-domain use. Bounded: collapsed
+    at mid with the note Bounded.collapse returns (SPEC §2), flagged bounds_collapsed. A tuple (or named tuple)
+    is unwrapped item by item. `flags` collects (kind, subject, detail)."""
     if v is None:
         return None
+    if isinstance(v, Bounded):
+        d, note = v.collapse("mid")
+        flags.append(("bounds_collapsed", name, note))
+        return unwrap(d, name, flags)
     if isinstance(v, Derived):
         if not v.everywhere_in_domain:
-            flags.append((name, f"{name} used outside its domain ({v.map or 'no map named'})"))
-        return v.value
+            flags.append(("out_of_domain", name, f"{name} used outside its domain ({v.map or 'no map named'})"))
+        return unwrap(v.value, name, flags)
+    if isinstance(v, tuple):                       # a named tuple keeps its type, so its items keep their names
+        items = [unwrap(x, name, flags) for x in v]
+        return type(v)(*items) if hasattr(v, "_fields") else tuple(items)
+    if isinstance(v, Mixing):
+        return Mixing(*(unwrap(getattr(v, f), name, flags) for f in ("f", "mu", "hess", "f_x", "mu_x")))
     return v
 
 

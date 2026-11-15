@@ -8,7 +8,7 @@ WATER, GUM, OCHRE = Sub("water", 998.0), Sub("gum", 1350.0), Sub("ochre", 3500.0
 SUBS3 = (WATER, GUM, OCHRE)
 KV3 = {"water": KT_V_SMALL, "gum": KT_V_SMALL / 50, "ochre": k_B * T_room / 1e-18}
 LAM3 = {"water": 2e-9 / KT_V_SMALL, "gum": 1e-10 / (KT_V_SMALL / 50), "ochre": 2 * (0.5e-6) ** 2 / (9 * 2 * mPa_s)}
-HUMID = Environment(potentials={"water": KT_V_SMALL * np.log(0.5)})
+HUMID = Environment(activity={"water": 0.5})
 
 
 def blobs(H, W, centres, radius, amounts):
@@ -30,7 +30,7 @@ def watercolour(H=24, W=28, tilt=3.0, dx=0.25 * mm, sorb=True, wet=True, tau=Non
     con = Analytic(SUBS3, eta=2 * mPa_s, tau=tau, kT_v=KV3, Lam=LAM3, k={"water": k, "gum": 0.0, "ochre": 0.0},
                    wet=(-3e-3, 0.5 * um) if wet else None,
                    sorb=({"water": 3e4, "gum": 0.0, "ochre": 0.0}, {"water": 2e-15, "gum": 0.0, "ochre": 0.0}) if sorb else None)
-    env = Environment(gravity=(0.5, tilt, 9.0), potentials={"water": KT_V_SMALL * np.log(0.5)})
+    env = Environment(gravity=(0.5, tilt, 9.0), activity={"water": 0.5})
     return World(con, SUBS3, g, dx, env, q=q)
 
 
@@ -39,8 +39,8 @@ def ledger_identity(r):
     into = sum(float(e.amount) for e in r.entries if e.ledger == "energy" and e.dst == "stored")
     out = sum(float(e.amount) for e in r.entries if e.ledger == "energy" and e.src == "stored")
     dF = sum(a for (_, a) in r.F.values()) - sum(b for (b, _) in r.F.values())
-    scale = sum(abs(a) for (_, a) in r.F.values()) + r.report["moved"] + 1e-300
-    return abs((into - out) - dF) / scale, r.report["moved"]
+    scale = sum(abs(a) for (_, a) in r.F.values()) + r.report["energy moved"] + 1e-300
+    return abs((into - out) - dF) / scale, r.report["energy moved"]
 
 
 def check_energy(r, tol=1e-12):

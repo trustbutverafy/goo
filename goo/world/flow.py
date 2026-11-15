@@ -41,8 +41,12 @@ def flow(ctx, q, dt):
     eta = coeff(ctx, "viscosity", q, None)
     if eta is None:
         raise ValueError("Constitutive: viscosity is required for a wet film")
+    eta = np.asarray(eta, np.float64)
+    if np.any(np.isnan(eta)) or np.any(eta[wet] <= 0):
+        raise ValueError("viscosity must be positive (+inf allowed: nothing flows)")
     with np.errstate(divide="ignore", invalid="ignore"):
-        Mc = np.where(wet, h * h * h / (3.0 * eta), 0.0)
+        # +inf viscosity (no liquid, or jammed) is a resistance with mobility exactly zero (SPEC §4.3)
+        Mc = np.where(wet & np.isfinite(eta), h * h * h / (3.0 * np.where(np.isfinite(eta), eta, 1.0)), 0.0)
     both = wL & wR
     M = np.where(both, 0.5 * (Mc[fL] + Mc[fR]), np.where(wL, Mc[fL], Mc[fR])) * rf
     M = np.where(cand, M, 0.0)
@@ -56,6 +60,11 @@ def flow(ctx, q, dt):
         tf = np.where(both, 0.5 * (tau[fL] + tau[fR]), np.where(wL, tau[fL], tau[fR]))
         with np.errstate(divide="ignore", invalid="ignore"):
             Y = np.where(cand, tf / hf, 0.0)
+        stuck = np.isposinf(Y)                    # an infinite yield stress: the face never moves
+        if stuck.any():
+            M = np.where(stuck, 0.0, M)
+            Y = np.where(stuck, 0.0, Y)
+            allowp, allowm = wL & (M > 0), wR & (M > 0)
     gx, gy, gn = ctx.g
     a = ctx.a
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -71,6 +80,7 @@ def flow(ctx, q, dt):
 
     o = _orient(G0p, G0m, allowp, allowm)
     capc = (dx / dt) * h                              # what a cell can give in this step, as a flux
+    cache = {}
 
     def solve(free, sat, o, Gd0, rbd, Y):
         """The step with the faces `free` flowing in their direction, every other face stuck, and the cells
@@ -87,23 +97,36 @@ def flow(ctx, q, dt):
         oa = o[act].astype(np.float64)
         G0 = Gd0[act] - oa * Y[act]
         one = np.ones(na)
-        C = sp.csr_matrix((np.concatenate([one, -one, rd, -rd]),
-                           (np.concatenate([iL, iR, n + iL, n + iR]), np.tile(np.arange(na), 4))), shape=(2 * n, na))
         ar = np.arange(n)
-        rows = [ar, ar, n + ar, n + ar]
-        cols = [ar, n + ar, ar, n + ar]
-        vals = [np.full(n, gn * a / 4), np.full(n, gn / 4), np.full(n, gn / 4), np.full(n, gn / (4 * a))]
         capf = np.flatnonzero(((pos[fL] >= 0) | (pos[fR] >= 0)) & gamon)
+        cap_rows, cap_cols, cap_vals = [], [], []
         if capf.size:
             pL, pR = pos[fL[capf]], pos[fR[capf]]
             gv = ctx.gam_f[capf] / dx ** 2
             kL, kR, kB = pL >= 0, pR >= 0, (pL >= 0) & (pR >= 0)
-            rows += [pL[kL], pR[kR], pL[kB], pR[kB]]
-            cols += [pL[kL], pR[kR], pR[kB], pL[kB]]
-            vals += [gv[kL], gv[kR], -gv[kB], -gv[kB]]
-        Hm = sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(2 * n, 2 * n))
+            cap_rows = [pL[kL], pR[kR], pL[kB], pR[kB]]
+            cap_cols = [pL[kL], pR[kR], pR[kB], pL[kB]]
+            cap_vals = [gv[kL], gv[kR], -gv[kB], -gv[kB]]
+        one_rho = rd.size > 0 and bool(np.all(rd == rd[0]))
+        if one_rho:
+            # every donor has one density rho: dm = rho dh exactly, and the system is in dh alone, with
+            # H = g_n (rho + a)^2 / (4 a) + the capillary Laplacian (the same equations, half the unknowns)
+            rho1 = float(rd[0])
+            C = sp.csr_matrix((np.concatenate([one, -one]), (np.concatenate([iL, iR]), np.tile(np.arange(na), 2))),
+                              shape=(n, na))
+            Hm = sp.csr_matrix((np.concatenate([np.full(n, gn * (rho1 + a) ** 2 / (4 * a))] + cap_vals),
+                                (np.concatenate([ar] + cap_rows), np.concatenate([ar] + cap_cols))), shape=(n, n))
+            nn = n
+        else:
+            C = sp.csr_matrix((np.concatenate([one, -one, rd, -rd]),
+                               (np.concatenate([iL, iR, n + iL, n + iR]), np.tile(np.arange(na), 4))), shape=(2 * n, na))
+            rows = [ar, ar, n + ar, n + ar] + cap_rows
+            cols = [ar, n + ar, ar, n + ar] + cap_cols
+            vals = [np.full(n, gn * a / 4), np.full(n, gn / 4), np.full(n, gn / 4), np.full(n, gn / (4 * a))] + cap_vals
+            Hm = sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(2 * n, 2 * n))
+            nn = 2 * n
         K = C @ sp.diags(Ma) @ C.T
-        Asys = sp.identity(2 * n, format="csr") + (dt / dx ** 2) * (K @ Hm)
+        Asys = sp.identity(nn, format="csr") + (dt / dx ** 2) * (K @ Hm)
         rhs = -(dt / dx) * (C @ (Ma * G0))
         dcell = np.where(oa > 0, fL[act], fR[act])
         scells = np.flatnonzero(sat)
@@ -122,13 +145,19 @@ def flow(ctx, q, dt):
             lu = splu(Afull)
             sol = lu.solve(bb)
             sol = sol + lu.solve(bb - Afull @ sol)               # one step of refinement
-            dy, lam_s = sol[:2 * n], sol[2 * n:]
+            dy, lam_s = sol[:nn], sol[nn:]
         else:
-            dy, lam_s = splu(Asys.tocsc()).solve(rhs), np.zeros(0)
+            Ac = Asys.tocsc()
+            Ac.sort_indices()
+            key = (Ac.shape, Ac.indptr.tobytes(), Ac.indices.tobytes(), Ac.data.tobytes())
+            if cache.get("key") != key:                 # the same matrix bit for bit: the same factors
+                cache["key"], cache["lu"] = key, splu(Ac)
+            dy, lam_s = cache["lu"].solve(rhs), np.zeros(0)
         lam = np.zeros(N)
         lam[scells] = lam_s
         dh_ = np.zeros(N); dm_ = np.zeros(N)
-        dh_[cells] = dy[:n]; dm_[cells] = dy[n:]
+        dh_[cells] = dy[:n]
+        dm_[cells] = rho1 * dy[:n] if one_rho else dy[n:]
         w_ = gn * (dm_ + a * dh_) / 4                      # potentials' increments on every cell, the
         dA = w_ + capillary_pressure(G, ctx.gam_f, dh_)     # inactive neighbours of active cells included
         dB = w_ / a
@@ -154,11 +183,12 @@ def flow(ctx, q, dt):
     free = oriented & ((Y == 0) | (o * Gd0 - Y > 0))
     sat = nocell.copy()
     seen, single = set(), False
+    seen_pd, primal = set(), False
     u = np.zeros(G.nF)
     U = np.zeros(G.nF)
     lam = np.zeros(N)
     cells = np.zeros(0, np.int64); capf = np.zeros(0, np.int64)
-    for _ in range(MAX_CLASS_ITER):
+    for _it in range(MAX_CLASS_ITER):
         sat &= np.bincount(donor[free], minlength=N) > 0
         if not free.any():
             U = np.zeros(G.nF); cells = np.zeros(0, np.int64); capf = np.zeros(0, np.int64); lam = np.zeros(N)
@@ -188,6 +218,17 @@ def flow(ctx, q, dt):
             free |= rel_f
             sat &= ~rel_c
             continue
+        if not primal:
+            # primal-dual move: every violator joins the working set at once (fast, usually final)
+            key = (free.tobytes(), sat.tobytes())
+            if key in seen_pd:
+                primal = True                    # it cycled: switch to the primal method, which cannot
+                u = np.zeros(G.nF)               # u = 0 is feasible for every working set
+            else:
+                seen_pd.add(key)
+                free &= ~neg
+                sat |= over
+                continue
         outu = np.bincount(donor[free], u[free], N)
         with np.errstate(divide="ignore", invalid="ignore"):
             rf_ = np.where(neg, u / (u - us), np.inf)

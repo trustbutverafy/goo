@@ -4,14 +4,33 @@ import hashlib
 import numpy as np
 from goo.film import Film, Ground, Stack
 from goo.ledger import Ledger, Receipt, Flag
-from goo.world.protocol import Environment, call
+from goo.world.protocol import Environment, call, unwrap
 from goo.world.grid import Grid, panel_faces
 from goo.world.common import Ctx, Reject, mixing, pore_B
+from goo.units import k_B
 from goo.world.flow import flow
 from goo.world.diffuse import diffuse
 from goo.world.local import local
 
 MAX_HALVINGS = 24
+
+
+def _union(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return (min(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), max(a[3], b[3]))
+
+
+def _inside(a, b):
+    """Box a inside box b."""
+    return b is not None and a[0] >= b[0] and a[1] <= b[1] and a[2] >= b[2] and a[3] <= b[3]
+
+
+def _sl(box):
+    y0, y1, x0, x1 = box
+    return np.s_[..., y0:y1, x0:x1]
 TERMS = ("gravity", "capillary", "wetting", "mixing", "exchange", "sorption")
 MECHANISMS = ("viscous", "plastic", "diffusion", "exchange", "sorption")
 
@@ -37,7 +56,11 @@ class World:
         self.q = np.zeros((S, H, W)) if q is None else np.array(q, np.float64)
         if self.q.shape != (S, H, W) or np.any(self.q < 0):
             raise ValueError("q must be [S, H, W] and non-negative")
-        self.strata = [np.array(s, np.float64) for s in strata]
+        self._strata = []                     # (box, q of the box, mass [S]): a stratum is stored on its bounding box
+        self._zb = np.array(self.ground.z, np.float64)
+        for st in strata:
+            self._push_stratum(np.array(st, np.float64))
+        self._shared = False
         self.env = environment if environment is not None else Environment()
         self.t = 0.0
         self.slope_bound, self.margin = float(slope_bound), int(margin)
@@ -46,16 +69,20 @@ class World:
         self.energy = Ledger("energy")
         self._grid = Grid(H, W, self.dx)
         self._coef_flags = []
-        self._lagged = self._coefficients()
+        self._store_coefficients(self._full, self._coefficients(self._full))
+        self._dirty = None
         self.matter.post("origin", "wet", self._mass(self.q), "initial film")
         if np.any(self.ground.held):
             self.matter.post("origin", "ground", self._mass(self.ground.held), "initial pores")
-        for k, s in enumerate(self.strata):
-            self.matter.post("origin", f"stratum[{k}]", self._mass(s), "initial stratum")
+        for k, st in enumerate(self._strata):
+            self.matter.post("origin", f"stratum[{k}]", st[2], "initial stratum")
+        self._Ftot = self._F_box(self._full)
         F0 = self.F()
         self.energy.post("work[origin]", "stored", sum(F0.values()), "initial free energy")
         self.receipt0 = Receipt("create", 0.0, 0.0, self.matter.since(0) + self.energy.since(0),
-                                self._residuals(F0, 0.0), {k: (0.0, v) for k, v in F0.items()})
+                                self._residuals(abs(sum(F0.values())), sum(F0.values()), 0.0,
+                                                sum(abs(v) for v in F0.values()), H * W),
+                                {k: (0.0, v) for k, v in F0.items()})
 
     # ---- state -------------------------------------------------------------------------------------------
     @property
@@ -63,86 +90,158 @@ class World:
         return Film(self.substances, self.q)
 
     @property
+    def _full(self):
+        return (0, self.H, 0, self.W)
+
+    @property
     def zb(self):
-        return self.ground.z + sum((s.sum(0) for s in self.strata), np.zeros((self.H, self.W)))
+        """The relief under the wet film: the ground and the strata, m (kept, not recomputed)."""
+        return self._zb
+
+    @property
+    def strata(self):
+        """The strata as full [S, H, W] arrays, bottom first (built on demand from their boxes)."""
+        out = []
+        for box, qb, _ in self._strata:
+            a = np.zeros((len(self.substances), self.H, self.W))
+            a[_sl(box)] = qb
+            out.append(a)
+        return out
+
+    def _push_stratum(self, full):
+        nz = full.sum(0) > 0
+        if nz.any():
+            rows, cols = np.flatnonzero(nz.any(1)), np.flatnonzero(nz.any(0))
+            box = (int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1)
+        else:
+            box = (0, 0, 0, 0)
+        qb = full[_sl(box)].copy()
+        self._strata.append((box, qb, self._mass(qb)))
+        self._zb[_sl(box)[1:]] += qb.sum(0)
+
+    def _own(self):
+        """Copy on write: a fork shares its arrays until one of the two changes them."""
+        if self._shared:
+            self.q = self.q.copy()
+            self.ground = self.ground.copy()
+            self._zb = self._zb.copy()
+            self._lagged = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in self._lagged.items()}
+            self._shared = False
 
     def _mass(self, q):
         return self.rho * np.asarray(q).sum((1, 2)) * self.dx ** 2
 
     def _mu_env(self):
-        pot = self.env.potentials
-        has = np.array([s.name in pot for s in self.substances])
-        return np.array([float(pot.get(s.name, 0.0)) for s in self.substances]), has
+        """The reservoirs' potentials [S] J/m^3, from the exchange map (SPEC §4.3), and which substances have one.
+        They depend on the environment and the substances only, so they are read on a one-cell film."""
+        S = len(self.substances)
+        fn = getattr(self.con, "exchange", None)
+        if fn is None:
+            return np.zeros(S), np.zeros(S, bool)
+        one = Film(self.substances, np.zeros((S, 1, 1)))
+        v = unwrap(fn(one, self.env), "exchange", [])
+        mu = np.asarray(v[1], np.float64).reshape(S)
+        has = np.isfinite(mu)          # a reservoir of activity 0 has mu = -inf: no finite term, refused below
+        return np.where(has, mu, 0.0), has
 
     # ---- lagged coefficients (DYNAMICS.md §2) -------------------------------------------------------------
-    def _coefficients(self):
+    def _coefficients(self, box):
+        """The lagged coefficients evaluated on a box of the panel (box-shaped), from the protocol."""
         flags = []
-        film = Film(self.substances, self.q)
-        wet = self.q.sum(0) > 0
+        sl = _sl(box)
+        y0, y1, x0, x1 = box
+        film = Film(self.substances, self.q[sl])
+        hb, wb = y1 - y0, x1 - x0
+        wet = film.h > 0
         gam = call(self.con, "surface_tension", film, flags=flags)
-        if gam is None or not np.any(np.asarray(gam) > 0):
-            gx, gy = np.zeros((self.H, self.W - 1)), np.zeros((self.H - 1, self.W))
+        if gam is None:
+            gx, gy = np.zeros((hb, max(wb - 1, 0))), np.zeros((max(hb - 1, 0), wb))
         else:
-            gam = np.where(np.isfinite(gam), np.asarray(gam, np.float64), 0.0)
+            gam = np.asarray(gam, np.float64)
+            gam = np.where(np.isfinite(gam), gam, 0.0)
 
             def face(gL, gR, wL, wR):
                 return np.where(wL == wR, 0.5 * (gL + gR), np.where(wL, gL, gR))
             gx = face(gam[:, :-1], gam[:, 1:], wet[:, :-1], wet[:, 1:])
             gy = face(gam[:-1, :], gam[1:, :], wet[:-1, :], wet[1:, :])
         wv = call(self.con, "wetting", film, self.ground, flags=flags)
-        Sw = ell = None
-        if wv is not None:
-            Sw, ell = (np.asarray(x, np.float64) for x in wv)
+        if wv is None:
+            Sw, ell = np.zeros((hb, wb)), np.ones((hb, wb))
+        else:
+            Sw, ell = (np.array(np.broadcast_to(np.asarray(x, np.float64), (hb, wb))) for x in wv[:2])
             if np.any(Sw > 0) or np.any((Sw != 0) & ~(ell > 0)):
                 raise ValueError("wetting: spreading coefficient must be <= 0 with a positive length")
-            if not np.any(Sw != 0):
-                Sw = ell = None
+            ell = np.where(ell > 0, ell, 1.0)
         sv = call(self.con, "sorption", film, self.ground, flags=flags)
-        P = Pb = None
-        if sv is not None:
-            P = np.asarray(sv[0], np.float64)
-            if not np.any(P != 0) or self.ground.capacity <= 0:
-                P = None
-            else:
-                Pb = P.max(0)
+        S = len(self.substances)
+        if sv is None or self.ground.capacity <= 0:
+            P = np.zeros((S, hb, wb))
+        else:
+            P = np.array(np.broadcast_to(np.asarray(sv[0], np.float64), (S, hb, wb)))
         self._coef_flags = flags
-        return dict(gx=gx, gy=gy, Sw=Sw, ell=ell, P=P, Pb=Pb)
+        return dict(gx=gx, gy=gy, Sw=Sw, ell=ell, P=P, Pb=P.max(0) if S else np.zeros((hb, wb)))
+
+    def _lag_box(self, box, lag=None):
+        """The panel's lagged coefficients on a box (views)."""
+        c = self._lagged if lag is None else lag
+        y0, y1, x0, x1 = box
+        return dict(gx=c["gx"][y0:y1, x0:max(x1 - 1, x0)], gy=c["gy"][y0:max(y1 - 1, y0), x0:x1],
+                    Sw=c["Sw"][y0:y1, x0:x1], ell=c["ell"][y0:y1, x0:x1], P=c["P"][:, y0:y1, x0:x1],
+                    Pb=c["Pb"][y0:y1, x0:x1])
+
+    def _store_coefficients(self, box, cb):
+        if box == self._full:
+            self._lagged = cb
+        else:
+            for k, v in self._lag_box(box).items():
+                v[...] = cb[k]
+        self._has_wet = bool(np.any(self._lagged["Sw"] != 0))
+        self._has_pore = bool(np.any(self._lagged["P"] != 0)) and self.ground.capacity > 0
 
     # ---- free energy -------------------------------------------------------------------------------------
-    def F(self, lagged=None):
-        """F by term, J (DYNAMICS.md §2), with the lagged coefficients in force (or those given)."""
-        c = self._lagged if lagged is None else lagged
+    def F(self):
+        """F by term, J (DYNAMICS.md §2): kept, and changed by each operation's increment over the region it
+        touched (outside it the state, and so F's density, is unchanged). F_recomputed() sums it afresh."""
+        return dict(self._Ftot)
+
+    def F_recomputed(self):
+        return self._F_box(self._full)
+
+    def _F_box(self, box, q=None, held=None, zb=None, lag=None):
+        """F by term over the cells of a box and the faces inside it, J."""
+        sl = _sl(box)
+        y0, y1, x0, x1 = box
+        q = self.q[sl] if q is None else q
+        held = self.ground.held[sl] if held is None else held
+        zb = self._zb[sl[1:]] if zb is None else zb
+        c = self._lag_box(box, lag)
         dx2 = self.dx ** 2
-        q = self.q
         h, m = q.sum(0), np.tensordot(self.rho, q, 1)
-        zb = self.zb
         gxv, gyv, gn = self.env.gravity
-        G = self._grid
-        X, Y = G.X.reshape(self.H, self.W), G.Y.reshape(self.H, self.W)
+        X = ((x0 + np.arange(x1 - x0)) + 0.5) * self.dx
+        Y = (((y0 + np.arange(y1 - y0)) + 0.5) * self.dx)[:, None]
         out = {}
-        out["gravity"] = dx2 * np.sum(gn * m * (zb + 0.5 * h) - m * (gxv * X + gyv * Y))
+        out["gravity"] = dx2 * np.sum(gn * m * (zb + 0.5 * h) - m * (gxv * X[None, :] + gyv * Y))
         s = zb + h
         cap = 0.0
-        for gam, sl in ((c["gx"], (np.s_[:, 1:], np.s_[:, :-1])), (c["gy"], (np.s_[1:, :], np.s_[:-1, :]))):
-            dh, ds, dz = h[sl[0]] - h[sl[1]], s[sl[0]] - s[sl[1]], zb[sl[0]] - zb[sl[1]]
+        for gam, a_, b_ in ((c["gx"], np.s_[:, 1:], np.s_[:, :-1]), (c["gy"], np.s_[1:, :], np.s_[:-1, :])):
+            dh, ds, dz = h[a_] - h[b_], s[a_] - s[b_], zb[a_] - zb[b_]
             cap += np.sum(0.5 * gam * dh * (ds + dz))
         out["capillary"] = cap
-        out["wetting"] = 0.0 if c["Sw"] is None else dx2 * np.sum((-c["Sw"]) * (-np.expm1(-h / c["ell"])))
-        wet = np.flatnonzero(h.ravel() > 0)
+        out["wetting"] = dx2 * np.sum((-c["Sw"]) * (-np.expm1(-h / c["ell"]))) if self._has_wet else 0.0
+        wetc = np.flatnonzero(h.ravel() > 0)
         mixf = 0.0
-        if wet.size:
-            ctx = self._ctx_stub()
-            mx = mixing(ctx, q.reshape(len(self.substances), -1)[:, wet])
+        if wetc.size:
+            mx = mixing(self._ctx_stub(), q.reshape(len(self.substances), -1)[:, wetc])
             if mx is not None:
                 mixf = dx2 * np.sum(mx[0] + mx[3])
         out["mixing"] = mixf
         menv, _ = self._mu_env()
-        out["exchange"] = -dx2 * np.sum(menv * q.sum((1, 2)))
+        out["exchange"] = -dx2 * np.sum(menv * (q.sum((1, 2)) + held.sum((1, 2))))
         pore = 0.0
-        if c["P"] is not None:
+        if self._has_pore:
             C = self.ground.capacity
-            w = self.ground.held
-            pore = dx2 * np.sum(-(c["P"] * w).sum(0) + c["Pb"] * C * pore_B(w.sum(0) / C))
+            pore = dx2 * np.sum(-(c["P"] * held).sum(0) + c["Pb"] * C * pore_B(held.sum(0) / C))
         out["sorption"] = pore
         return {k: float(v) for k, v in out.items()}
 
@@ -154,7 +253,9 @@ class World:
     # ---- the step ----------------------------------------------------------------------------------------
     def step(self, dt, rate=None, window="auto"):
         """Advance by dt (s). rate: None, a scalar or an [H, W] field >= 0 multiplying every Psi* (SPEC §8).
-        window: 'auto' (the wet cells' bounding box plus a margin) or 'panel'. Returns a Receipt."""
+        window: 'auto' (the wet cells' bounding box plus a margin) or 'panel'. Returns a Receipt. Its work is on
+        the region R that can change (the window and what changed in the last step); F, the coefficients and the
+        slope are evaluated there, and the rest of the panel is not read."""
         dt = float(dt)
         if not dt > 0:
             raise ValueError("dt must be positive")
@@ -163,25 +264,43 @@ class World:
             raise ValueError("rate must be finite")
         if np.any(r < 0):
             raise ValueError("rate < 0 reverses the world (SPEC §8, impossible); reverse steps are not implemented yet")
+        self._own()
         mm, me = self.matter.mark(), self.energy.mark()
         t0 = self.t
         flags = []
-        Fb = self.F()
-        self._relabel(Fb, flags)
+        sb = float(self.energy.balance("stored"))
+        Fb0 = self.F()
+        R = _union(self._window(window), self._dirty)
+        acc = {k: 0.0 for k in MECHANISMS}
+        acc.update(num_time=0.0, num_transport=0.0, moved=0.0, pieces=0.0)
+        e = np.zeros(len(self.substances)); a = np.zeros(len(self.substances))
+        rnd = 0.0
+        relabel = 0.0
+        dF = 0.0
+        sl = 0.0
+        if R is not None:
+            relabel, rnd = self._relabel(R, flags)
         Fb = self.F()
         if rate is not None and not np.all(r == 1.0):
-            flags.append(Flag("privilege", "painter", f"clock rate in [{r.min():g}, {r.max():g}]", float(dt * r.mean())))
-        acc = {k: 0.0 for k in MECHANISMS}
-        acc.update(num_time=0.0, num_transport=0.0, moved=0.0)
-        e = np.zeros(len(self.substances)); a = np.zeros(len(self.substances))
+            flags.append(Flag("privilege", "painter", f"clock rate in [{r.min():g}, {r.max():g}]; amount: integral of r over cells and time, m^2 s",
+                              float(dt * np.sum(r) * self.dx ** 2)))
         ctxflags = []
-        if np.any(r > 0):
+        if R is not None and np.any(r > 0):
+            self._saved = [R, self.q[_sl(R)].copy(), self.ground.held[_sl(R)].copy()]
             for rep in self._advance(dt, r, window, 0, ctxflags):
                 for k in MECHANISMS:
                     acc[k] += rep[k]
                 acc["num_time"] += rep["num_time"]; acc["num_transport"] += rep["num_transport"]
                 acc["moved"] += rep["moved"]
+                acc["pieces"] += 1
                 e += rep["e"]; a += rep["a"]
+            R, q0, h0 = self._saved
+            del self._saved
+            before, after = self._F_box(R, q=q0, held=h0), self._F_box(R)
+            for k in TERMS:
+                self._Ftot[k] += after[k] - before[k]
+                dF += after[k] - before[k]
+            rnd += sum(abs(v) for v in before.values()) + sum(abs(v) for v in after.values())
         self.t = t0 + dt
         if np.any(e):
             self.matter.post("wet", "reservoir[atmosphere]", self.rho * e, "exchange")
@@ -196,32 +315,43 @@ class World:
             self.energy.post("stored", "dissipated[numerical]", acc["num_transport"], "transport")
         Fa = self.F()
         flags += self._flags(ctxflags)
-        sl = self.slope()
+        if R is not None:
+            sl = self.slope(R)
+            self._dirty = R
         if sl > self.slope_bound:
             flags.append(Flag("slope", "film", f"max surface slope {sl:.3g} above the bound {self.slope_bound:g}", sl))
-        res = self._residuals(Fa, acc["moved"])
-        rcpt = Receipt("step", t0, self.t, self.matter.since(mm) + self.energy.since(me), res,
-                       {k: (Fb[k], Fa[k]) for k in TERMS}, tuple(flags))
-        object.__setattr__(rcpt, "report", dict(acc))
-        return rcpt
+        ncell = 0 if R is None else (R[1] - R[0]) * (R[3] - R[2])
+        res = self._residuals(acc["moved"] + abs(relabel), dF + relabel, sb, rnd, ncell)
+        report = {f"D {k}": float(acc[k]) for k in MECHANISMS}
+        report.update({"D_num time": float(acc["num_time"]), "D_num transport": float(acc["num_transport"]),
+                       "energy moved": float(acc["moved"]), "max slope": sl, "pieces": acc["pieces"],
+                       "rate integral": float(dt * np.sum(r) * self.dx ** 2)})
+        return Receipt("step", t0, self.t, self.matter.since(mm) + self.energy.since(me), res,
+                       {k: (Fb[k], Fa[k]) for k in TERMS}, tuple(flags), report)
 
     def _flags(self, pairs):
         seen, out = set(), []
-        for name, detail in list(self._coef_flags) + list(pairs):
-            if (name, detail) not in seen:
-                seen.add((name, detail)); out.append(Flag("out_of_domain", name, detail))
+        for kind, name, detail in list(self._coef_flags) + list(pairs):
+            if (kind, name, detail) not in seen:
+                seen.add((kind, name, detail)); out.append(Flag(kind, name, detail))
         return out
 
-    def _relabel(self, Fb, flags):
-        """Re-evaluate the lagged coefficients; book the change of F at fixed state (DYNAMICS.md §2)."""
-        new = self._coefficients()
-        Fn = self.F(new)
-        d = sum(Fn.values()) - sum(Fb.values())
-        self._lagged = new
+    def _relabel(self, R, flags):
+        """Re-evaluate the lagged coefficients on R; book the change of F at fixed state (DYNAMICS.md §2).
+        Returns (the change, the magnitude of the F values it was computed from)."""
+        old = {k: v.copy() for k, v in self._lag_box(R).items()}
+        Fo = self._F_box(R)
+        self._store_coefficients(R, self._coefficients(R))
+        Fn = self._F_box(R)
+        d = 0.0
+        for k in TERMS:
+            self._Ftot[k] += Fn[k] - Fo[k]
+            d += Fn[k] - Fo[k]
         if d != 0.0:
             self.energy.post("work[constitutive]", "stored", d, "lagged coefficients re-evaluated")
             flags.append(Flag("out_of_domain", "lagged coefficient",
                               "a coefficient of F changed with the state; Marangoni-type coupling not modelled", d))
+        return d, sum(abs(v) for v in Fo.values()) + sum(abs(v) for v in Fn.values())
 
     def _advance(self, dt, r, window, depth, ctxflags):
         try:
@@ -252,6 +382,15 @@ class World:
         win = self._window(window)
         if win is None:
             return rep
+        sv = getattr(self, "_saved", None)
+        if sv is not None and not _inside(win, sv[0]):
+            # the window reaches beyond the region saved at the step's start: outside that region nothing has
+            # changed yet, so the state there is still the start's and is saved now
+            U = _union(win, sv[0])
+            nq, nh = self.q[_sl(U)].copy(), self.ground.held[_sl(U)].copy()
+            o = (sv[0][0] - U[0], sv[0][1] - U[0], sv[0][2] - U[2], sv[0][3] - U[2])
+            nq[_sl(o)] = sv[1]; nh[_sl(o)] = sv[2]
+            self._saved = [U, nq, nh]
         y0, y1, x0, x1 = win
         Hh, Ww = y1 - y0, x1 - x0
         G = Grid(Hh, Ww, self.dx, y0, x0)
@@ -259,9 +398,11 @@ class World:
         flat = lambda arr: None if arr is None else np.ascontiguousarray(arr[..., y0:y1, x0:x1]).reshape(arr.shape[:-2] + (-1,))
         menv, has = self._mu_env()
         flags = []
-        ctx = Ctx(G, self.substances, self.rho, self.con, self.env, self.ground, flat(self.zb), flat(r),
-                  panel_faces(c["gx"], c["gy"], y0, y1, x0, x1), flat(c["Sw"]), flat(c["ell"]), flat(c["P"]),
-                  flat(c["Pb"]), self.ground.capacity, self.a, menv, has, flags)
+        wetting, pores = self._has_wet, self._has_pore          # decided on the panel, so a window decides alike
+        ctx = Ctx(G, self.substances, self.rho, self.con, self.env, self.ground, flat(self._zb), flat(r),
+                  panel_faces(c["gx"], c["gy"], y0, y1, x0, x1), flat(c["Sw"]) if wetting else None,
+                  flat(c["ell"]) if wetting else None, flat(c["P"]) if pores else None,
+                  flat(c["Pb"]) if pores else None, self.ground.capacity, self.a, menv, has, flags)
         q = flat(self.q).copy()
         held = flat(self.ground.held).copy()
         q1, fr = flow(ctx, q, dt)
@@ -283,20 +424,28 @@ class World:
         return rep
 
     # ---- residuals, flags --------------------------------------------------------------------------------
-    def _residuals(self, F, moved):
+    def _residuals(self, moved, dF, sb, mag, ncells):
+        """Closure residuals of an operation. Matter: every account against the state, over the mass present.
+        Energy: the change the ledger booked to `stored` against the change of F recomputed on the region it
+        touched (dF), beyond the rounding of those F values (a few ulps of their magnitude `mag`), over the energy
+        the operation moved, floored at k_B T per cell of the region (below which no number in F means anything)."""
         state = {"wet": self._mass(self.q), "ground": self._mass(self.ground.held)}
-        for k, s in enumerate(self.strata):
-            state[f"stratum[{k}]"] = self._mass(s)
+        for k, st in enumerate(self._strata):
+            state[f"stratum[{k}]"] = st[2]
         scale = float(sum(np.sum(v) for v in state.values())) or 1.0
         rm = max(float(np.max(np.abs(self.matter.balance(k) - v))) for k, v in state.items()) / scale
-        Ftot = sum(F.values())
-        escale = max(sum(abs(v) for v in F.values()), moved, 1e-300)
-        re = abs(float(self.energy.balance("stored")) - Ftot) / escale
+        dS = float(self.energy.balance("stored")) - sb
+        floor = max(ncells, 1) * k_B * self.env.T
+        rnd = 16 * np.finfo(float).eps * mag
+        re = max(0.0, abs(dS - dF) - rnd) / max(moved, abs(dF), floor)
         return {"matter": rm, "energy": re}
 
-    def slope(self):
-        """Largest surface slope |grad s| over faces touching a wet cell."""
-        s, wet = self.zb + self.q.sum(0), self.q.sum(0) > 0
+    def slope(self, box=None):
+        """Largest surface slope |grad s| over faces touching a wet cell (in a box of the panel, or all of it)."""
+        box = self._full if box is None else box
+        sl = _sl(box)
+        h = self.q[sl].sum(0)
+        s, wet = self._zb[sl[1:]] + h, h > 0
         out = 0.0
         for d, w in ((np.diff(s, axis=1), wet[:, 1:] | wet[:, :-1]), (np.diff(s, axis=0), wet[1:, :] | wet[:-1, :])):
             if w.any():
@@ -318,52 +467,97 @@ class World:
             arr = np.array(np.broadcast_to(np.asarray(amounts, np.float64), (S, self.H, self.W)))
         if np.any(arr < 0) or not np.all(np.isfinite(arr)):
             raise ValueError("add: amounts must be finite and non-negative (taking matter out is a body's act)")
+        self._own()
         mm, me, t = self.matter.mark(), self.energy.mark(), self.t
-        Fb = self.F()
-        self.q += arr
+        box = self._box_of(arr.sum(0) > 0)
+        Fb = self.F(); sb = float(self.energy.balance("stored"))
+        d, mag = self._change(box, lambda: self.q.__iadd__(arr))
         Fa = self.F()
         self.matter.post(src, "wet", self._mass(arr), "added")
-        self.energy.post(f"work[{src}]", "stored", sum(Fa.values()) - sum(Fb.values()), "free energy brought")
-        return Receipt("add", t, t, self.matter.since(mm) + self.energy.since(me), self._residuals(Fa, 0.0),
+        self.energy.post(f"work[{src}]", "stored", d, "free energy brought")
+        return Receipt("add", t, t, self.matter.since(mm) + self.energy.since(me),
+                       self._residuals(abs(d), d, sb, mag, self._ncells(box)),
                        {k: (Fb[k], Fa[k]) for k in TERMS}, tuple(self._flags([])))
+
+    def _box_of(self, mask):
+        """The bounding box of a mask, grown by one cell (the faces around it), or None."""
+        if not mask.any():
+            return None
+        rows, cols = np.flatnonzero(mask.any(1)), np.flatnonzero(mask.any(0))
+        return (max(0, int(rows[0]) - 1), min(self.H, int(rows[-1]) + 2), max(0, int(cols[0]) - 1),
+                min(self.W, int(cols[-1]) + 2))
+
+    @staticmethod
+    def _ncells(box):
+        return 0 if box is None else (box[1] - box[0]) * (box[3] - box[2])
+
+    def _change(self, box, act):
+        """Run `act` (which changes the state only inside `box`), update F's totals by its increment on the box,
+        and mark the box for the next coefficient refresh. Returns (dF, the magnitude of the F values used)."""
+        if box is None:
+            act()
+            return 0.0, 0.0
+        before = self._F_box(box)
+        act()
+        after = self._F_box(box)
+        d = 0.0
+        for k in TERMS:
+            self._Ftot[k] += after[k] - before[k]
+            d += after[k] - before[k]
+        self._dirty = _union(self._dirty, box)
+        return d, sum(abs(v) for v in before.values()) + sum(abs(v) for v in after.values())
 
     def retire(self, mask=None, substances=None):
         """Turn the given substances (default all) of the wet film in `mask` (default every wet cell) into a new
         stratum on top of the others (SPEC §6). Matter wet -> stratum[k]; the change of the live F stored -> frozen."""
+        self._own()
         sel = np.ones(len(self.substances), bool) if substances is None else np.isin(
             [s.name for s in self.substances], [getattr(x, "name", x) for x in substances])
         mk = (self.q.sum(0) > 0) if mask is None else np.asarray(mask, bool)
         moved = np.where(sel[:, None, None] & mk[None], self.q, 0.0)
         mm, me, t = self.matter.mark(), self.energy.mark(), self.t
-        Fb = self.F()
-        self.q = self.q - moved
-        self.q[sel[:, None, None] & mk[None]] = 0.0
-        k = len(self.strata)
-        self.strata.append(moved)
+        Fb = self.F(); sb = float(self.energy.balance("stored"))
+        k = len(self._strata)
+
+        def act():
+            self.q -= moved
+            self.q[sel[:, None, None] & mk[None]] = 0.0
+            self._push_stratum(moved)
+        d, mag = self._change(self._box_of(moved.sum(0) > 0), act)
         Fa = self.F()
-        self.matter.post("wet", f"stratum[{k}]", self._mass(moved), "retired")
-        self.energy.post("stored", "frozen", sum(Fb.values()) - sum(Fa.values()), f"retired into stratum[{k}]")
-        return Receipt("retire", t, t, self.matter.since(mm) + self.energy.since(me), self._residuals(Fa, 0.0),
+        self.matter.post("wet", f"stratum[{k}]", self._strata[k][2], "retired")
+        self.energy.post("stored", "frozen", -d, f"retired into stratum[{k}]")
+        return Receipt("retire", t, t, self.matter.since(mm) + self.energy.since(me),
+                       self._residuals(abs(d), d, sb, mag, self._ncells(self._box_of(moved.sum(0) > 0))),
                        {kk: (Fb[kk], Fa[kk]) for kk in TERMS}, ())
 
     def set_environment(self, environment):
-        """Change the reservoirs: an act whose ΔF is work by the environment's port."""
+        """Change the reservoirs: an act whose ΔF is work by the environment's port. It changes F everywhere, so
+        F is evaluated on the whole panel."""
         mm, me, t = self.matter.mark(), self.energy.mark(), self.t
-        Fb = self.F()
+        Fb = self.F(); sb = float(self.energy.balance("stored"))
+        before = self._F_box(self._full)
         self.env = environment
+        after = self._F_box(self._full)
+        d = 0.0
+        for k in TERMS:
+            self._Ftot[k] += after[k] - before[k]
+            d += after[k] - before[k]
         Fa = self.F()
-        self.energy.post("work[environment]", "stored", sum(Fa.values()) - sum(Fb.values()), "environment changed")
-        return Receipt("environment", t, t, self.energy.since(me), self._residuals(Fa, 0.0),
+        self.energy.post("work[environment]", "stored", d, "environment changed")
+        mag = sum(abs(v) for v in before.values()) + sum(abs(v) for v in after.values())
+        return Receipt("environment", t, t, self.energy.since(me), self._residuals(abs(d), d, sb, mag, self.H * self.W),
                        {k: (Fb[k], Fa[k]) for k in TERMS}, ())
 
     # ---- forks, looks, digests ---------------------------------------------------------------------------
     def fork(self):
+        """An independent world that continues identically (O6). Arrays are shared, copy on write: each of the two
+        copies them the first time it changes them, so a fork costs the ledgers' bookkeeping, not the panel."""
         new = copy.copy(self)
-        new.q = self.q.copy()
-        new.ground = self.ground.copy()
-        new.strata = [s.copy() for s in self.strata]
+        self._shared = new._shared = True
+        new._strata = list(self._strata)                 # strata are immutable once retired
         new.matter, new.energy = self.matter.fork(), self.energy.fork()
-        new._lagged = {k: (None if v is None else v.copy()) for k, v in self._lagged.items()}
+        new._Ftot = dict(self._Ftot)
         new._coef_flags = list(self._coef_flags)
         return new
 
@@ -376,16 +570,21 @@ class World:
         films = [Film(self.substances, ro(s)) for s in self.strata] + [Film(self.substances, ro(self.q))]
         return Stack(ground, films, self.dx)
 
-    def digest(self):
-        h = hashlib.sha256(repr((self.t, self.env.T, self.env.gravity, sorted(self.env.potentials.items()))).encode())
-        for a in [self.q, self.ground.z, self.ground.held] + self.strata:
+    def _hash_state(self, h):
+        for a in (self.q, self.ground.z, self.ground.held):
             h.update(np.ascontiguousarray(a).tobytes())
+        for box, qb, _ in self._strata:
+            h.update(repr(box).encode()); h.update(np.ascontiguousarray(qb).tobytes())
+
+    def digest(self):
+        h = hashlib.sha256(repr((self.t, self.env.T, self.env.gravity, sorted(self.env.activity.items()),
+                                   self.env.boundary_layer)).encode())
+        self._hash_state(h)
         h.update(self.matter.digest().encode()); h.update(self.energy.digest().encode())
         return h.hexdigest()
 
     def state_digest(self):
         """Digest of the state arrays alone (no ledgers)."""
         h = hashlib.sha256(repr(self.t).encode())
-        for a in [self.q, self.ground.z, self.ground.held] + self.strata:
-            h.update(np.ascontiguousarray(a).tobytes())
+        self._hash_state(h)
         return h.hexdigest()

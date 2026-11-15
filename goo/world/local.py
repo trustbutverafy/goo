@@ -16,7 +16,8 @@ def local(ctx, q, held, dt):
     wet = (h > 0) & (ctx.r > 0)
     if not wet.any():
         return q, held, rep
-    k = coeff(ctx, "exchange", q, None, ctx.env)
+    ex = coeff(ctx, "exchange", q, None, ctx.env)
+    k = None if ex is None else ex[0]
     son = None
     if ctx.P is not None and ctx.cap > 0:
         sv = coeff(ctx, "sorption", q, None, ctx.ground)
@@ -175,6 +176,7 @@ def local(ctx, q, held, dt):
     if not nonmix:
         mx1 = mixing(ctx, q1)
         dF += dx ** 2 * np.sum((mx1[0] + mx1[3]) - (mx0[0] + mx0[3]))
+    dF += -dx ** 2 * np.sum(ctx.mu_env[:, None] * av)          # the pores' matter is counted against its reservoir
     if ctx.P is not None and C > 0 and av.any():
         th0, th1 = w0 / C, (w0 + av.sum(0)) / C
         dB = -(th1 - th0) - np.log1p(-(th1 - th0) / (1 - th0))

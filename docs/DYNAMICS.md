@@ -42,7 +42,7 @@ F_grav = Σ_c dx² [ g_n m (z_b + h/2)  −  m (g_x x_c + g_y y_c) ]
 F_cap  = Σ_f ½ γ_f [ (s_R − s_L)² − (z_R − z_L)² ]                          (½ ∫ γ (|∇s|² − |∇z_b|²))
 F_wet  = Σ_c dx² (−S_c) (1 − exp(−h/ℓ_c))                                    S ≤ 0 spreading coefficient, ℓ > 0
 F_mix  = Σ_c dx² f(q_c; T)                                                    from the protocol, J/m²
-F_exch = −Σ_c dx² Σ_i μ°_i q_i                                               volatiles with a reservoir
+F_exch = −Σ_c dx² Σ_i μ°_i (q_i + w_i)                                       film and pores, against the reservoir
 F_pore = Σ_c dx² [ −Σ_i P_i w_i + P_b C B(θ) ],   B(θ) = −θ − ln(1 − θ)     P_b = max_i P_i
 ```
 
@@ -51,13 +51,19 @@ F_pore = Σ_c dx² [ −Σ_i P_i w_i + P_b C B(θ) ],   B(θ) = −θ − ln(1 �
 - *Capillarity*: the liquid surface's excess area, small slope (R1). The baseline −(Δz)² makes F_cap
   exactly zero on bare ground, so bare cells hold no energy and are rest states (O4, O5).
 - *Wetting*: covering bare ground costs −S = γ(1 − cos θ_c) per area once the film is thicker than
-  ℓ. Concave in h. With S = 0 it is absent exactly.
+  ℓ. Concave in h. With S = 0 it is absent exactly. Its increments are computed as
+  sign(δh)(−S) e^{−min(h,h')/ℓ}(1 − e^{−|δh|/ℓ}), finite for a molecular ℓ against micrometre films.
 - *Mixing*: f is the protocol's: ideal mixing plus interaction. It must be homogeneous of degree 1 in
   q (an intensive free energy per volume times h), as every mixing free energy is. The protocol gives
   f with its potentials μ_i = ∂f/∂q_i and Hessian, split into a convex part (implicit) and a concave
   part (explicit, may be zero).
 - *Exchange*: a reservoir at fixed potential μ°_i (the atmosphere: μ° = (k_B T/v) ln a for a volatile
-  at activity a). Grand potential form, as VISION §6 writes it. Changing μ° is work by a port.
+  at activity a > 0). The `exchange` map turns goo.film.Environment's activities into μ° (SPEC §4.3); a
+  substance the environment does not name has no reservoir and no term. Grand potential form, as VISION
+  §6 writes it. Every amount that can reach the reservoir is counted, the pores' as well as the film's,
+  so sorption is a transfer inside F with its own D_mech (counting only the film would book nearly all
+  of −μ° q of the water that soaks in to D_num). Strata are not counted: retired matter's free energy
+  is in `frozen`. Changing μ° is work by a port.
 - *Sorption*: liquid in the pores lowers F by its suction P_i (Laplace, 2γ cos θ / r, from the
   protocol) and a convex barrier keeps θ < 1. The barrier's form is `assumed`.
 
@@ -159,7 +165,12 @@ boundary and the blocking face or cell joins the working set; when feasible, fac
 violated multipliers are released (all at once, or one at a time once a working set repeats, which is
 the textbook anti-cycling rule). Each iteration lowers Φ, so it terminates. A stuck face whose force
 exceeds its threshold by less than 1e-12 of the largest force is at the threshold to rounding and is
-not released. Then each substance moves in flux form, q_i ← (1 − α_c) q_i + inflow_i with
+not released. Where every donor in the solve has one density ρ, δm = ρ δh exactly and the system is solved in δh
+alone (H = g_n(ρ + a)²/(4a) + the capillary Laplacian): the same equations, half the unknowns. An LU
+is reused when a later solve has the same matrix bit for bit. Before the primal method, the working
+set takes primal-dual moves (every violator joins at once), which settle a drying front in a few
+iterations; only if a working set repeats does it switch to the primal method above.
+Then each substance moves in flux form, q_i ← (1 − α_c) q_i + inflow_i with
 α_c = outflow_c/hⁿ_c ≤ 1 (exactly 1 for a saturated cell).
 
 *Acceptance*: any substep that fails (the active set or a Newton iteration does not settle, an amount
@@ -168,10 +179,16 @@ an error. The capillary stiffness is implicit and is not limited; nothing is lim
 
 **4.2 Diffusion** (h fixed, composition moves). Unknowns q_i on the active (cell, substance) pairs.
 Implicit Euler in μ (convex mixing at the new state, concave at the old, gravity's ρ_i ψ exact because it
-is linear in q at fixed h), with the upwind mobility at the new state (§3), solved by Newton (the
-Jacobian includes the mobility's derivative; an amount may fall at most tenfold per iteration, so it
-stays > 0), on the active pairs in canonical order, iterated until the upwind directions repeat and the
-update is below 1e-12 of each amount (plus 1e-14 of the cell's thickness); then applied in flux form.
+is linear in q at fixed h), with the upwind mobility at the new state (§3), solved by Newton in ln q
+(the Jacobian includes the mobility's derivative; the step is du = dq/q from the same factors, a rise
+capped at e² per iteration; a backtracking line search on the residual), with the factors kept while
+the residual falls tenfold per iteration (chord), on the active pairs in canonical order, until the
+upwind directions repeat, the update is below 1e-12 of each amount (plus 1e-14 of the cell's
+thickness) and the flux-form update is non-negative; then applied in flux form. An upwind direction
+changes only where the relative force exceeds the rounding of the potentials (1e-12 of their size);
+where it does not, the flux is rounding too and either donor is an admissible mobility. An entering
+amount whose iterate falls below e⁻³⁰ of the cell gets no inflow and is dropped exactly, its faces
+carrying none of it (the entry rule, R6, applied during the solve).
 Common parts of μ (capillary, wetting, the h-derivatives of gravity) cancel exactly under L·1 = 0.
 
 *Entry* (**R6**): a substance enters a neighbouring cell that lacks it only if, at e⁻³⁰ of the donor's
@@ -199,6 +216,10 @@ diffusion   dt dx² Σ_f Xᵀ r L X                  exchange  dx² Σ e²/(dt r
 
 each a sum of non-negative terms, so D_mech ≥ 0 in floating point, not only in exact arithmetic. At
 the solution of each substep these equal Σ flux · force (U(G − cY) = U²/(rM), and the rest likewise).
+
+*Residual.* An operation's energy closure residual compares what it booked to `stored` with the change
+of F recomputed on the region it touched, beyond the rounding of those F values (16 ulps of their
+magnitude), over the energy it moved, floored at k_B T per cell of the region.
 
 **D_num** is the remainder, −ΔF + W − D_mech, booked to `dissipated[numerical]`. ΔF of each substep is
 computed from increments (quadratic terms exactly as ∇·δ + ½δ·Hδ, wetting with expm1), not as a
@@ -283,6 +304,15 @@ O3 only under a step bound (explicit Euler on a convex F has D_num = −Bregman 
 term's stiffness, dt ≲ 3η dx⁴/(γ h³) ≈ 1e-6 s for water at 0.1 mm, makes it useless. Neither obligation
 is relaxed.
 
+*Cost proportional to the active region.* A step works on R, the window together with what changed in
+the last step: coefficients are refreshed on R, F's totals are kept and changed by F(after) − F(before)
+recomputed on R (outside it the state is untouched, so F's density is too; the window's three-cell
+margin makes every face crossing R's edge join unchanged cells), and the slope is read on R. If a
+halving's window reaches past R, R grows, and the cells added are saved as they were at the step's
+start (they have not changed yet). Strata are stored on their bounding boxes and z_b is kept, not
+recomputed. A fork shares every array and copies it on its first write (O6 tested). What remains
+panel-sized per step is element-wise bookkeeping (the wet mask, the rate field, mass sums).
+
 ## 7. Clocks (SPEC §8)
 
 `rate` multiplies every Ψ* (a field on cells; faces take the min of their cells). rate = 0 makes every
@@ -297,6 +327,20 @@ first) and raises z_b by their thickness. The change of the live F is computed a
 before and after and moved from `stored` to `frozen`: nothing is dropped. `add(amounts)` is a source
 port: matter from `origin`, energy F(after) − F(before) from `work[origin]`. Changing the environment
 books its ΔF as `work[environment]`. `fork()` copies the state and both ledgers.
+
+## 10. Cure and dissolution: not yet terms
+
+*Cure* does not fit the gradient structure with the maps as they are. `reactions(film, env)` gives a
+rate of extent (first order, 1/s) and no affinity, and a rate with no free energy is not a term of F or
+Ψ*. With a free energy of reaction (g° per kg of each substance, or ΔG° per kg of extent, and the
+reservoir species' potentials per kg), the term is F_rx = Σ dx² Σ_i ρ_i q_i g°_i, the reservoir's draw is
+work by its port, the affinity is A = −Σ_i ν_i (g°_i + μ_i/ρ_i) − Σ_res ν_res μ_res, and Ψ* = k m A₊
+(convex, zero at 0) gives the map's first-order rate wherever A > 0 and stops at equilibrium.
+
+*Dissolution* needs a stratum to hold a live potential. Under the retirement rule its free energy is in
+`frozen`, outside F, so no force can drive matter out of it. It needs the top stratum's mixing free
+energy kept in F (frozen holding only what cannot move) and a rate-coefficient map for stratum-to-liquid
+transfer.
 
 ## 9. Orders (O7) and what is verified
 
