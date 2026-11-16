@@ -379,7 +379,7 @@ K1  docs/DYNAMICS.md; the step with O1 to O8 on the first terms              bui
     with the real maps takes 5.5 to 6.3 s and 1.7 GB; a full-panel 30 um paste of water, gum arabic and rutile dries
     until settle() retires every cell in 12 minutes of wall time
     owed: stages 2 and 3 (activity per substep; multigrid flow: moving paint at 300,000 cells is still out of
-    reach); particle mobility through the Onsager matrix is about 1e-16 m^2/s where Stokes-Einstein gives 1e-12;
+    reach); a particle in a solution still diffuses at the liquid's molecular mobility (in a single liquid it is right);
     pore water does not evaporate; cure and dissolution (xfail); surface tension is lagged
 K2  light on the first rung with G1 to G7                                    built; owner's tests pass (tests/light/); not yet refereed
 K3  ports, the first bodies, journal, replay, clocks                         built without a mechanical port: paints, vessels, pour, flood, drop, drip,

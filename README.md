@@ -11,6 +11,7 @@ law it breaks. Three ledgers (matter, energy, light) account for every operation
 
 - `SPEC.md` is the contract. Its §12 says what exists today, which is not much yet.
 - `docs/VISION.md` gives the reasons. `docs/MATTER-SPEC.md` is the decision about substances.
+- `docs/HANDOFF.md` is where things stand: how to run it, what was measured, what is next, what is known wrong.
 - `AGENTS.md` has the working rules.
 - `docs/PERFORMANCE.md` says why the kernel is slow today, with measurements, and the staged plan to fix it.
 - `paintings/nocturne/` is the first picture made with the kernel's tools, with an account of what it is and is not.
