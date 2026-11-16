@@ -243,3 +243,25 @@ def test_new_maps_are_element_wise():
     for a, b in zip(ra, rb):
         assert np.array_equal(a.affinity.value.reshape(-1)[cells], b.affinity.value.reshape(-1))
         assert np.all(np.isfinite(a.affinity.value))
+
+
+def test_the_hessian_vector_product_does_not_depend_on_its_chunk_size():
+    """Regression: the chunk loop reused a name and went wrong from its second chunk on."""
+    from goo.substance import _freeenergy as FE
+    import inspect
+    rng = np.random.default_rng(3)
+    H, W = 24, 40
+    subs = (L.WATER, L.GUM_ARABIC, L.RUTILE)
+    h = 30e-6 * (1 + 0.3 * rng.random((H, W)))
+    q = np.stack([h * (0.5 + 0.2 * rng.random((H, W))), h * 0.1, h * 0.3])
+    f = Film(subs, q)
+    dq = 1e-9 * rng.standard_normal(q.shape)
+    want = maps.mixing_hvp(f, dq).value
+    default = inspect.signature(FE.hvp).parameters["chunk"].default
+    old = FE.hvp
+    try:
+        FE.hvp = lambda ms, q_, T, dq_, chunk=default: old(ms, q_, T, dq_, chunk=97)
+        got = maps.mixing_hvp(f, dq).value
+    finally:
+        FE.hvp = old
+    assert np.array_equal(got, want)

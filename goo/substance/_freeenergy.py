@@ -401,11 +401,11 @@ def hvp(ms, q, T, dq, chunk=65536):
         for c0 in range(0, rows.size, chunk):
             r = rows[c0:c0 + chunk]
             Hr = kernel(ms, k, _rows(U, sel, r), TU[r], True)[2]
-            sel = cells[(pos[inv[cells]] >= c0) & (pos[inv[cells]] < c0 + chunk)]
-            j = pos[inv[sel]] - c0
-            d = dq[np.ix_(k, wi[sel])]
+            cs = cells[(pos[inv[cells]] >= c0) & (pos[inv[cells]] < c0 + chunk)]
+            j = pos[inv[cs]] - c0
+            d = dq[np.ix_(k, wi[cs])]
             acc = np.zeros(d.shape)
             for b in range(k.size):                              # a fixed order of summation: element-wise bits
                 acc += Hr[:, b, j] * d[b]
-            out[np.ix_(k, wi[sel])] = acc / hw[sel]
+            out[np.ix_(k, wi[cs])] = acc / hw[cs]
     return out
