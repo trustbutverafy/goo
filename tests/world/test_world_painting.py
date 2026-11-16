@@ -322,3 +322,35 @@ def test_a_particle_film_drains_its_last_water_exactly(kind):
     assert np.array_equal(w.q[1], q[1])
     assert r.residual["matter"] <= 1e-12 and r.residual["energy"] <= 1e-9, r.residual
     assert r.report["D_num time"] >= 0.0
+
+
+def test_a_dilute_pigment_interdiffuses_with_water_at_stokes_einstein():
+    """1 % rutile in water with a 10 % cosine of its fraction (no gravity, no reservoir): the mode decays at
+    D_c k^2, D_c = h Lambda_p phi_p (H_pp - 2 H_pw + H_ww) the maps' collective diffusivity (Stokes-Einstein times the
+    hard-sphere factor, 1.08 at 1 %), k^2 the grid's own eigenvalue. Through the mixture-mean Onsager matrix the pair
+    moved at water's molecular mobility, about 1e-16 m^2/s (DYNAMICS.md §3: the pair conductance on a face whose liquid
+    is one substance). Measured: the rate within 0.1 % of D_c k^2, by the ray (no Newton)."""
+    from goo.film import Film
+    H, W, dx, h = 4, 8, 50 * um, 20 * um
+    subs = (L.WATER, L.RUTILE)
+    x = (np.arange(W) + 0.5) / W
+    phi = 0.01 * (1 + 0.1 * np.cos(np.pi * x))[None, :] * np.ones((H, 1))
+    q = np.stack([h * (1 - phi), h * phi])
+    w = World(maps, subs, ground("sealed", H, W, subs), dx, Environment(gravity=(0.0, 0.0, 0.0)), q=q)
+    mode = np.cos(np.pi * x)
+
+    def amp():
+        return float(((w.q[1].mean(0) / h - 0.01) * mode).sum() / (mode * mode).sum())
+    a0 = amp()
+    for _ in range(10):
+        r = w.step(200.0)
+        assert not r.flagged("solver") and r.residual["matter"] <= 1e-12 and r.residual["energy"] <= 1e-9
+    rate = -np.log(amp() / a0) / 2000.0
+    f = Film(subs, np.stack([np.full((1, 1), h * 0.99), np.full((1, 1), h * 0.01)]))
+    Hs = maps.mixing(f).value.hess[:, :, 0, 0]
+    lam = maps.mobility(f).value[:, 0, 0]
+    Dc = h * lam[1] * 0.01 * (Hs[1, 1] - 2 * Hs[0, 1] + Hs[0, 0])
+    k2 = (2 / dx ** 2) * (1 - np.cos(np.pi / W))
+    assert abs(rate / (Dc * k2) - 1) <= 0.02, (rate, Dc * k2)
+    D_se = maps.diffusivity(f).value[1, 0, 0]
+    assert 1.0 <= Dc / D_se <= 1.2                       # Stokes-Einstein, times the dilute hard-sphere factor

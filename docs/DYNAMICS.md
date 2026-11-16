@@ -245,19 +245,30 @@ counter-flux), it is not representable against the fluxes that balance it, and t
 of it this step. A numerical threshold on representability, not a physical constant.
 
 
-*Particles in the Onsager matrix* (an open defect, found with the substance maps' particle thermodynamics).
-L = diag(ω) − ωωᵀ/Σω gives each substance a friction against the ω-weighted mean motion. For a particle p in one
-liquid w the pair's conductance is ω_p ω_w/(ω_p + ω_w), the smaller of the two: water's molecular mobility
-(Λ_w = D_w v_w/k_B T ≈ 1e-17 m²/(Pa s)) and not the particle's Stokes mobility (d²/18η ≈ 5e-12 for 0.3 um rutile), so
-the world interdiffuses particles and water at about 1e-16 m²/s where Stokes-Einstein (times the maps' thermodynamic
-factor) gives about 1e-12. Water's self-diffusion is friction of water against water; a particle's motion through the
-liquid is resisted by Stokes drag. The construction that says so is a network of pair conductances,
-L = Σ_{i<k} c_ik (e_i − e_k)(e_i − e_k)ᵀ (symmetric, positive semi-definite and L·1 = 0 for any c ≥ 0, so §5 holds):
-liquid with liquid c_lk = ω_l ω_k / W_L (W_L = Σ_liquids ω, the present rule among liquids), particle with liquid
-c_pl = ω_p ω_l / W_L (the particle drifts through the liquid at its own mobility: j_p = ω_p (X_p − X̄_L)), particle with
-particle 0 (no direct exchange). Without particles it is the present L. Not yet built: it needs the world to know which
-substances are particles (a description field, morphology, read through the protocol) and a new Jacobian for the
-Newton; until then particles in water diffuse too slowly, which is admissible (any L ⪰ 0 is) but wrong in rate.
+*Particles in the Onsager matrix.* L = diag(ω) − ωωᵀ/Σω gives each substance a friction against the ω-weighted mean
+motion. For a particle p in one liquid w the pair's conductance is then ω_p ω_w/(ω_p + ω_w), the smaller of the two:
+water's molecular mobility (Λ_w = D_w v_w/k_B T ≈ 1e-17 m²/(Pa s)), not the particle's Stokes mobility (d²/18η ≈ 5e-12
+for 0.3 um rutile). So particles and water interdiffused at about 1e-16 m²/s where Stokes-Einstein, times the maps'
+hard-sphere factor, gives about 1e-12. Water's self-diffusion is the friction of water against water; a particle moving
+through its liquid is resisted by Stokes drag. **The rule now:** on a face where a particle moves in a liquid of one
+substance, the same on both sides, L is a network of pair conductances, L = Σ_{i<k} c_ik (e_i − e_k)(e_i − e_k)ᵀ, with
+c_pl = ω_p (the particle drifts through the liquid at its own mobility, j_p = ω_p (X_p − X_l), and the liquid carries the
+counter-flux) and c_pp' = 0. L is symmetric, positive semi-definite and L·1 = 0 for any c ≥ 0, so §5 holds; without
+particles every face keeps the old rule bit for bit. The liquid takes part even if it has no mobility of its own.
+Measured (tests/world/test_world_painting.py): a 1 % rutile mode in water decays at D_c k² to 0.1 %, D_c = 1.08 D_SE (the
+maps' collective diffusivity), by the ray; the stiffness stays gone (D_c dt/dx² is 1e-4 to 1e-2 at the painter's dt).
+
+*Where the liquid is a solution* (two liquids or more on the face) the old rule stays, a stated gap. Three pair rules
+were tried for a particle in a solution, and each fails: (1) particle against the liquids by their mobilities (c_pl =
+ω_p ω_l / W_liquids): the particle then exchanges volume with water alone and changes the solution's composition, whose
+Flory-Huggins curvature (k_B T / v_w ≈ 1e8 Pa) makes the step stiff (the ray's t* fell to 0.025 on a gum-water wash);
+(2) against the solution in the face's mean composition: solution of a mean composition arriving in a cell mixes its
+liquids, with the same stiffness; (3) against the solution of the cell it leaves (upwind per particle): the shares then
+depend on the particle's direction, the Newton's directions two-cycle, and the Gibbs-Duhem cancellation that removes the
+liquids' mixing from Σ_l y_l X_l holds only to first order across a composition jump. A particle in a gum solution
+therefore still diffuses at the solution's molecular rate. The right rule needs the particle's drift against the
+solution's barycentric motion with a force from which the liquids' mixing cancels exactly (a mechanical, not a
+chemical, potential of the solution): next rung.
 
 **4.2a The ray** (how diffusion is solved first; the Newton above is its fallback). Diffusion at these resolutions is
 not stiff (D dt/dx² ≈ 1e-4 to 0.06 for gum and water at dt of seconds and dx = 0.25 mm), so one explicit Onsager flux

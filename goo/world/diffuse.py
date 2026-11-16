@@ -102,9 +102,27 @@ def diffuse(ctx, q, dt):
     # Only substances that move on some face are unknowns: the others carry no flux (omega = 0 removes their rows and
     # columns of L), so the system is assembled on the moving substances sa alone and the rest pass through.
     sa = np.flatnonzero((om_kappa > 0).any(1))
+    partall = particles_of(ctx.substances)
+    pmove = bool(partall[sa].any())
+    if pmove:
+        # the liquids present take part through the particles' exchange with the solution, mobile or not (DYNAMICS §3)
+        sa = np.union1d(sa, np.flatnonzero(~partall & (q0 > 0).any(1)))
     Sa = sa.size
     kap = om_kappa[sa]
     on = kap > 0
+    part = partall[sa]
+    pairf = None
+    if pmove:
+        # faces where a particle moves in a liquid of one substance, the same on both sides (DYNAMICS.md §3): there the
+        # particle drifts through that liquid at its own mobility
+        lq = q0[sa][~part] > 0
+        oneL = (lq[:, iL] & lq[:, iR]).sum(0) == 1
+        sameL = np.all(lq[:, iL] == lq[:, iR], axis=0) & (lq[:, iL].sum(0) == 1)
+        pairf = oneL & sameL & on[part].any(0)
+        lidx = np.flatnonzero(~part)[np.argmax(lq[:, iL] & lq[:, iR], axis=0)]   # its row (where pairf)
+        # that liquid takes part even if it has no mobility of its own
+        on = on | ((~part)[:, None] & pairf[None, :] & (q0[sa][:, iL] > 0) & (q0[sa][:, iR] > 0))
+    Yof = (lambda up_: (pairf, lidx)) if pmove else (lambda up_: None)
     q0a, mux0a, grava = q0[sa], mux0[sa], grav[sa]
     qfa = qfl[sa]
 
@@ -139,18 +157,16 @@ def diffuse(ctx, q, dt):
         if up is None:                              # donors from the forces with a centred guess
             w = kap * 0.5 * (phiL + phiR)
             Wg = w.sum(0)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                up = (X - np.where(Wg > 0, (w * X).sum(0) / Wg, 0.0)) >= 0     # True: i flows L -> R, donor L
+            up = X >= 0 if pmove else onsager(w, X, part)[1] >= 0              # True: i flows L -> R, donor L
+            if pmove:
+                up = onsager(w, X, part, Yof(up))[1] >= 0
         omg = kap * np.where(up, phiL, phiR)
-        W = omg.sum(0)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            Xb = np.where(W > 0, (omg * X).sum(0) / W, 0.0)
-        j = omg * (X - Xb)
+        j, Xr, W = onsager(omg, X, part, Yof(up))
         # a direction changes only where the relative force is clear of rounding (where it is not, the flux is
         # rounding too, and either donor is an admissible mobility)
         fscale = np.max(np.where(on, np.abs(mu[:, iL]) + np.abs(mu[:, iR]), 0.0), axis=0, keepdims=True) / dx
-        clear = np.abs(X - Xb) > 1e-12 * fscale        # the rounding of a difference of potentials of this size
-        upn = np.where((omg > 0) & clear, (X - Xb) >= 0, up)
+        clear = np.abs(Xr) > 1e-12 * fscale            # the rounding of a difference of potentials of this size
+        upn = np.where((omg > 0) & clear, Xr >= 0, up)
         dv = np.empty((Sa, n)); gr = np.empty((Sa, n))
         for i in range(Sa):
             dv[i] = np.bincount(iL, j[i], n) - np.bincount(iR, j[i], n)
@@ -159,12 +175,12 @@ def diffuse(ctx, q, dt):
             aj = np.abs(j[i]) + omg[i] * (np.abs(mu[i, iL]) + np.abs(mu[i, iR])) / dx
             gr[i] = (dt / dx) * (np.bincount(iL, aj, n) + np.bincount(iR, aj, n))
         H = mx[2][sa][:, sa]
-        return H, X, j, dv, omg, W, Xb, up, upn, gr
+        return H, X, j, dv, omg, W, Xr, up, upn, gr
 
     # the ray (DYNAMICS.md §4.2a): one explicit Onsager flux at the old state and the exact search along its ray, where
     # no substance enters a cell that lacks it; the Newton below is the fallback when the ray's step falls short
     if not new.any():
-        ray = _ray(ctx, q0, sa, kap, iL, iR, hc, mux0a, grava, mx0, dt, dx)
+        ray = _ray(ctx, q0, sa, kap, iL, iR, hc, mux0a, grava, mx0, dt, dx, part, Yof, on)
         if ray is not None:
             t, q1a, D = ray
             st = ctx.stats
@@ -216,7 +232,7 @@ def diffuse(ctx, q, dt):
                 # judged on the residual) at the floor, where the mixing Hessian (~ 1/q) is finite
                 qfull[sa] = np.where(low, qfa[:, None], qp)
                 Hj = mixing(ctx, qfull)[2][sa][:, sa]
-            Jm = _jacobian(Sa, n, nu_of(pj), unk, iL, iR, up, kap, hc, Hj, omg, W, X, Xb, c, dt, dx)
+            Jm = _jacobian(Sa, n, nu_of(pj), unk, iL, iR, up, kap, hc, Hj, omg, X, part, Yof(up), c, dt, dx)
             if not np.all(np.isfinite(Jm.data)):
                 raise Reject("diffusion: non-finite Jacobian")
             lu, lu_up = Inner(Jm, G.IY[ucell], G.IX[ucell], pi, ctx.stats), up.copy()
@@ -288,9 +304,7 @@ def diffuse(ctx, q, dt):
     mx1 = mixing(ctx, q1)
     dF = (dx ** 2 * np.sum((mx1[0] + mx1[3]) - (mx0[0] + mx0[3])) + dF_grav(ctx, cells, q0, dqf)
           + dF_cap(ctx, capf, h, dh) + dF_wet(ctx, cells, hc, dh[cells]) + dF_exch(ctx, dqf))
-    dX = X[:, None, :] - X[None, :, :]
-    with np.errstate(divide="ignore", invalid="ignore"):
-        Dm = np.where(W > 0, 0.5 * np.sum(omg[:, None, :] * omg[None, :, :] * dX * dX, axis=(0, 1)) / W, 0.0)
+    Dm = onsager_dissipation(omg, X, part, Yof(up))
     rep.update(D_diffusion=dt * dx ** 2 * np.sum(Dm), dF=dF, cells=cells)
     return qn, rep
 
@@ -299,7 +313,7 @@ RAY_MIN = 0.9        # the ray's step as a share of the explicit flux below whic
 RAY_ITERS = 40       # safeguarded Newton-bisection iterations on the ray's derivative (each one mixing evaluation)
 
 
-def _ray(ctx, q0, sa, kap, iL, iR, hc, mux0a, grava, mx0, dt, dx):
+def _ray(ctx, q0, sa, kap, iL, iR, hc, mux0a, grava, mx0, dt, dx, part, Yof=None, on=None):
     """The diffusion substep as one explicit Onsager flux and an exact search along its ray (DYNAMICS.md §4.2a).
 
     At the old state: X_i = -(mu_i,R - mu_i,L)/dx with the full potential (mixing, both parts, and rho_i psi),
@@ -313,7 +327,7 @@ def _ray(ctx, q0, sa, kap, iL, iR, hc, mux0a, grava, mx0, dt, dx):
     from goo.world.common import mixing_potentials, mixing_hvp
     S, n = q0.shape
     q0a = q0[sa]
-    on = kap > 0
+    on = (kap > 0) if on is None else on
     mu = mx0[1][sa] + mux0a + grava
     muL, muR = mu[:, iL], mu[:, iR]
     if not (np.all(np.isfinite(muL[on])) and np.all(np.isfinite(muR[on]))):
@@ -321,17 +335,15 @@ def _ray(ctx, q0, sa, kap, iL, iR, hc, mux0a, grava, mx0, dt, dx):
     X = np.where(on, -(muR - muL) / dx, 0.0)
     phiL, phiR = q0a[:, iL] / hc[iL], q0a[:, iR] / hc[iR]
     w = kap * 0.5 * (phiL + phiR)
-    Wg = w.sum(0)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        up = (X - np.where(Wg > 0, (w * X).sum(0) / Wg, 0.0)) >= 0
+    Yof = (lambda u: None) if Yof is None else Yof
+    up = X >= 0
+    up = onsager(w, X, part, Yof(up))[1] >= 0
     fscale = np.max(np.where(on, np.abs(muL) + np.abs(muR), 0.0), axis=0, keepdims=True) / dx
     for _ in range(4):
         omg = kap * np.where(up, phiL, phiR)
-        W = omg.sum(0)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            Xb = np.where(W > 0, (omg * X).sum(0) / W, 0.0)
-        clear = np.abs(X - Xb) > 1e-12 * fscale
-        upn = np.where((omg > 0) & clear, (X - Xb) >= 0, up)
+        j0, Xr0, W = onsager(omg, X, part, Yof(up))
+        clear = np.abs(Xr0) > 1e-12 * fscale
+        upn = np.where((omg > 0) & clear, Xr0 >= 0, up)
         if np.array_equal(upn, up):
             break
         up = upn
@@ -339,15 +351,20 @@ def _ray(ctx, q0, sa, kap, iL, iR, hc, mux0a, grava, mx0, dt, dx):
     # a relative force below the rounding of the potentials it is a difference of (1e-12 of their size, the Newton's
     # rule for directions) carries no flux: on a face where one substance moves alone, X - Xbar is such rounding (L is
     # exactly 0 there). D_num >= 0 needs only Phi'(t) <= 0 and D_mech = t^2 D1 with the D1 of Phi, so this is admissible.
-    Xr = np.where(clear, X - Xb, 0.0)
-    j = omg * Xr
+    Xr = np.where(clear, Xr0, 0.0)
+    # a liquid with no mobility of its own carries only the particles' counter-flux (onsager's j, unmasked)
+    j = np.where(omg > 0, omg * Xr, j0)
     dv = np.empty((Sa, n)); out = np.empty((Sa, n))
     for i in range(Sa):
         dv[i] = np.bincount(iL, j[i], n) - np.bincount(iR, j[i], n)
         out[i] = np.bincount(iL, np.maximum(j[i], 0.0), n) + np.bincount(iR, np.maximum(-j[i], 0.0), n)
     delta = -(dt / dx) * dv
     out *= dt / dx
-    D1 = dt * dx ** 2 * float(np.sum(omg * Xr * Xr))
+    # D1, the dissipation of the flux j: flux times force, dt dx^2 sum j X. Without particles sum omega Xr X =
+    # sum omega Xr^2 (sum omega Xr = 0), which is written so (non-negative term by term); with particles the flux-times-
+    # force sum itself (the pair form's X^T L X when nothing is masked), used only when positive (below)
+    D1 = (dt * dx ** 2 * float(np.sum(omg * Xr * Xr)) if not part.any()
+          else max(dt * dx ** 2 * float(np.sum(j * X)), 0.0))
     if not D1 > 0:
         return (1.0, q0a.copy(), 0.0) if D1 == 0.0 and not np.any(delta) else None
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -420,20 +437,96 @@ def _ray(ctx, q0, sa, kap, iL, iR, hc, mux0a, grava, mx0, dt, dx):
     return t, q0a + t * delta, t * t * D1
 
 
+def particles_of(substances):
+    """[S] bool: the substances that are particle populations (a morphology in their description, SPEC §4.1), which
+    move through the liquid by their own (Stokes) mobility rather than against the mixture's mean (DYNAMICS.md §3)."""
+    return np.array([getattr(s, "morph", None) is not None for s in substances], bool)
+
+
+def _mixture(omg, X):
+    W = omg.sum(0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        Xb = np.where(W > 0, (omg * X).sum(0) / W, 0.0)
+    Xr = X - Xb
+    return omg * Xr, Xr, W
+
+
+def onsager(omg, X, part, pf=None):
+    """The relative fluxes on faces: (j, Xr, W), j = omega Xr for the mobile substances. omg, X [S', nf]; part [S']
+    (particles); pairf [nf] the faces where a particle moves in a liquid of one substance (the same on both sides).
+
+    Everywhere but pairf: L = diag(omega) - omega omega^T / W (every substance against the mixture's mean motion), bit
+    for bit the rule before particles were told apart. On pairf (DYNAMICS.md §3): pair conductances, particle-liquid
+    omega_p (a particle drifts through its liquid at its own Stokes mobility: j_p = omega_p (X_p - X_l), the liquid
+    carries the counter-flux), particle-particle 0."""
+    jm, Xrm, W = _mixture(omg, X)
+    if pf is None or not part.any() or not pf[0].any():
+        return jm, Xrm, W
+    pairf, li = pf
+    XL = X[li, np.arange(X.shape[1])]                                          # the face's one liquid's force
+    jp = np.zeros_like(X)
+    jp[part] = omg[part] * (X[part] - XL)
+    tot = jp[part].sum(0)
+    jp[li, np.arange(X.shape[1])] = -tot
+    j = np.where(pairf[None, :], jp, jm)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        Xr = np.where(pairf[None, :], np.where(omg > 0, j / np.where(omg > 0, omg, 1.0), 0.0), Xrm)
+    return j, Xr, W
+
+
+def onsager_dissipation(omg, X, part, pf=None):
+    """X^T L X per face, as a sum of non-negative terms (pair conductances times squared force differences)."""
+    W = omg.sum(0)
+    dX = X[:, None, :] - X[None, :, :]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        Dm = np.where(W > 0, 0.5 * np.sum(omg[:, None, :] * omg[None, :, :] * dX * dX, axis=(0, 1)) / W, 0.0)
+    if pf is None or not part.any() or not pf[0].any():
+        return Dm
+    pairf, li = pf
+    XL = X[li, np.arange(X.shape[1])]
+    Dp = np.sum(omg[part] * (X[part] - XL) ** 2, axis=0)
+    return np.where(pairf, Dp, Dm)
+
+
+def onsager_mats(omg, X, part, pf=None):
+    """(L [S', S', nf], dj/domega [S', S', nf]) of onsager()'s fluxes, for the Newton's Jacobian."""
+    S = omg.shape[0]
+    eye = np.eye(S)[:, :, None]
+    W = omg.sum(0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        Wp = W > 0
+        Lf = np.where(Wp, omg[:, None, :] * (eye - omg[None, :, :] / W), 0.0)
+        Xb = np.where(Wp, (omg * X).sum(0) / W, 0.0)
+        Xr = X - Xb
+        dJw = np.where(Wp, eye * Xr[:, None, :] - omg[:, None, :] * Xr[None, :, :] / W, 0.0)
+    if pf is None or not part.any() or not pf[0].any():
+        return Lf, dJw
+    f = np.flatnonzero(pf[0])
+    li = pf[1][f]
+    Lp = np.zeros((S, S, f.size)); dJp = np.zeros((S, S, f.size))
+    for p in np.flatnonzero(part):
+        o = omg[p, f]
+        Lp[p, p] += o
+        Lp[p, li, np.arange(f.size)] -= o
+        Lp[li, p, np.arange(f.size)] -= o
+        Lp[li, li, np.arange(f.size)] += o
+        dJp[p, p] = X[p, f] - X[li, f]
+        dJp[li, p, np.arange(f.size)] = -(X[p, f] - X[li, f])
+    Lf[:, :, f] = Lp
+    dJw[:, :, f] = dJp
+    return Lf, dJw
+
+
 def nu_of(pj):
     return pj.size
 
 
-def _jacobian(S, n, nu, unk, iL, iR, up, kap, hc, H, omg, W, X, Xb, c, dt, dx):
+def _jacobian(S, n, nu, unk, iL, iR, up, kap, hc, H, omg, X, part, Y, c, dt, dx):
     """J = I + d(dt/dx div j)/dq' on the unknowns. Each face f couples its cells L and R through two S x S blocks,
     V_L (columns at L) and V_R (columns at R): rows at L get +V, rows at R get -V. Cell-diagonal blocks are summed per
     cell before assembly, so every entry is written once."""
-    with np.errstate(divide="ignore", invalid="ignore"):
-        Wp = W > 0
-        Lf = np.where(Wp, omg[:, None, :] * (np.eye(S)[:, :, None] - omg[None, :, :] / W), 0.0)
-        # d j_i / d omega_m, times d omega_m / d q'_m(donor) = kappa_m / h(donor)
-        Xr = X - Xb
-        dJw = np.where(Wp, np.eye(S)[:, :, None] * Xr[:, None, :] - omg[:, None, :] * Xr[None, :, :] / W, 0.0)
+    # L and d j_i / d omega_m (times d omega_m / d q'_m(donor) = kappa_m / h(donor) below)
+    Lf, dJw = onsager_mats(omg, X, part, Y)
     mob = (dt / dx) * dJw * (kap / np.where(up, hc[iL], hc[iR]))[None, :, :]
     VL = np.where(up[None, :, :], mob, 0.0)
     VR = np.where(up[None, :, :], 0.0, mob)
