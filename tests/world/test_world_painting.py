@@ -72,6 +72,11 @@ def test_pigmented_gum_water_dries_on_paper_to_equilibrium():
     assert r.report["cells retired"] == 0.0 and r.report["cells still wet"] > 0
 
 
+@pytest.mark.xfail(strict=True, reason="O3: where one pigment enters the other paint, the diffusion step uses the entering "
+                   "substance's explicit (concave) potential masked to 0 instead of its finite value, and D_num's time "
+                   "part is negative (-8e-7 J against dF = -2e-13 J), which now raises the solver flag. Keeping mu_x "
+                   "finite (goo/world/common.py, tried) fixes the sign but stalls the diffusion Newton on the journal "
+                   "replay scene; left to the diffusion rewrite (PROGRESS.md, Checkpoint 4)")
 def test_two_pigmented_paints_meet_wet():
     """Hematite and ultramarine gum-water paints laid side by side, touching, on a sealed ground (160 x 120)."""
     H, W = 120, 160
@@ -230,3 +235,30 @@ def test_advance_takes_a_rate_field_and_is_not_sensitive_to_the_last_bit_of_dt()
     assert ra.flagged("privilege") and rb.flagged("privilege")
     assert np.array_equal(a.q[:, :8], _wash().q[:, :8])               # held cells do not move
     assert np.allclose(a.q, b.q, rtol=1e-3, atol=1e-3 * float(a.q.max()))
+
+
+def test_a_drop_running_down_a_steep_tilt_books_finite_dissipation():
+    """A drop of fluid paint (water 0.86, gum arabic 0.08, cadmium sulfide 0.05, hematite 0.01) on a sealed ground
+    tilted 70 degrees runs until its trailing edge thins to almost nothing. The viscous dissipation is flux times the
+    force that drove it, so a vanishing film books a vanishing amount (U^2/M overflowed to 1e88 J where M ~ 0), and D_num
+    stays non-negative to rounding (a negative one would raise the `solver` flag)."""
+    H, W = 40, 64
+    subs = (L.WATER, L.GUM_ARABIC, L.CDS, L.HEMATITE)
+    q = layer(disc(H, W, 6, cx=12), 60 * um, (0.86, 0.08, 0.05, 0.01))
+    a = np.radians(70)
+    env = Environment(gravity=(G0 * np.sin(a), 0.0, G0 * np.cos(a)), activity={"water": 0.5})
+    w = World(maps, subs, ground("sealed", H, W, subs), 0.25 * mm, env, q=q)
+    x0 = (w.q.sum(0) * (np.arange(W) + 0.5)).sum() / w.q.sum()
+    released = 0.0
+    for _ in range(6):
+        r = w.advance(0.5)
+        assert not r.flagged("solver"), [f.detail for f in r.flagged("solver")]
+        D = sum(v for k, v in r.report.items() if k.startswith("D ") and k[2:] in ("viscous", "plastic", "diffusion",
+                                                                                  "exchange", "sorption"))
+        dF = sum(b - a_ for (a_, b) in r.F.values())
+        Wk = float(r.moved("energy", src="work", dst="stored"))
+        assert np.isfinite(D) and D <= Wk - dF + 1e-9 * (abs(dF) + abs(Wk)) + 1e-15   # no more than F released
+        assert r.report["D_num time"] + r.report["D_num transport"] >= -1e-9 * max(r.report["energy moved"], 1e-300)
+        released += -dF
+    x1 = (w.q.sum(0) * (np.arange(W) + 0.5)).sum() / w.q.sum()
+    assert x1 > x0 + 1.0

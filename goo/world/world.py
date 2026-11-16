@@ -372,11 +372,15 @@ class World:
             report["solver iterations"] = float(self._stats.get("solver iterations", 0))
             report["solver tolerance"] = RTOL
             report["solver fallbacks"] = float(self._stats.get("solver fallbacks", 0))
-            dn = acc["num_time"] + acc["num_transport"]
-            if dn < -1e-12 * max(acc["moved"], 1e-300):
-                flags.append(Flag("out_of_domain", "iterative solver",
-                                  "D_num negative beyond rounding: its sign holds only to the solver's tolerance", dn))
+
         nwet = 0 if R is None else int(np.count_nonzero(self.q[_sl(R)].sum(0) > 0))     # the same in a window
+        # the time part's sign is the construction's (§5); the transport part's is not established for a mixing f
+        # with a concave interaction part (a stated gap, §5 "Flow and mixing"), so only the time part is judged here
+        dn = acc["num_time"]
+        if dn < -1e-12 * max(acc["moved"], 1e-300) - 16 * np.finfo(float).eps * rnd:
+            flags.append(Flag("solver", self._solver_now,
+                              "D_num negative beyond rounding" + (": its sign holds only to the solver's tolerance"
+                                                                  if self._solver_now == "iterative" else ""), dn))
         report.update({"max energy floor": float(nwet * k_B * self.env.T), "D_num time": float(acc["num_time"]), "D_num transport": float(acc["num_transport"]),
                        "D_num local": float(acc["num_local"]), "D_num constraint": float(acc["num_constraint"]), "drained cells": float(acc["drained"]),
                        "energy moved": float(acc["moved"]), "max slope": sl, "pieces": acc["pieces"],

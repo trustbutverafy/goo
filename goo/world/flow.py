@@ -206,6 +206,7 @@ def flow(ctx, q, dt):
     # stuck for the rest of this step (otherwise a degenerate pair of moves can repeat forever)
     bounced = np.zeros(G.nF, bool)
     released = np.zeros(G.nF, bool)
+    nblock = np.zeros(G.nF, np.int64)
     tolo = np.where(o > 0, tolp, tolm)
     seen_pd, primal = set(), False
     u = np.zeros(G.nF)
@@ -261,8 +262,13 @@ def flow(ctx, q, dt):
         alpha = float(min(rf_.min(), rc_.min()))
         u = u + alpha * (us - u)
         bf = neg & (rf_ <= alpha)
-        if alpha <= 0.0:
-            bounced |= bf & released
+        # a face blocked again after its release, before a feasible point is reached, twice (or once with no
+        # step to rounding) is held stuck for the rest of the step: the minimiser over the smaller cone (u_f = 0) is
+        # still a constrained minimiser of the same convex Phi, so §5 holds (DYNAMICS.md §4.1), and the degenerate
+        # cycles of release and block end (observed: 400 iterations at alpha = 1e-19 / 8e-4)
+        hit = bf & released
+        nblock[hit] += 1
+        bounced |= hit & ((alpha <= 1e-12) | (nblock >= 2))
         u[bf] = 0.0
         free &= ~bf
         sat |= over & (rc_ <= alpha)
@@ -307,6 +313,10 @@ def flow(ctx, q, dt):
     # of D_num (DYNAMICS.md §5, "Constraints"), reported apart: it is O(1) in dt (a cell empties, or dewets, whatever
     # the step), so it is not a time-step error
     Dc = dt * dx ** 2 * float(np.sum(np.maximum(lam[donor[act]], 0.0) * au)) if sat.any() else 0.0
-    rep.update(D_viscous=dt * dx ** 2 * np.sum(au * au / M[act]), D_plastic=dt * dx ** 2 * np.sum(Y[act] * au),
+    # viscous dissipation as flux times the force that drove it, |U| (o G - Y - lam_donor): equal to U^2/(rM) at the
+    # solution, but finite where M is vanishingly small (a cell holding almost nothing), where U^2/M overflows; each
+    # term is clipped at 0 (it is >= 0 at the solution; below that is rounding), so D_mech >= 0 in floating point
+    drive = np.maximum(o[act] * Gd[act] - Y[act] - (lam[donor[act]] if sat.any() else 0.0), 0.0)
+    rep.update(D_viscous=dt * dx ** 2 * np.sum(au * drive), D_plastic=dt * dx ** 2 * np.sum(Y[act] * au),
                dE=dE, dF_mix=dFmix, cells=cells, faces=act, D_constraint=Dc, D_wetting=Dw)
     return qn, rep

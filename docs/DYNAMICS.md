@@ -187,9 +187,11 @@ old force's direction (R5: a frozen choice; any orientation keeps §5), and the 
 cells of its free faces, so a stiff paste costs nothing next to a moving wash. A face with a threshold is *at* it to
 rounding when its excess is below 1e-12 of max(the largest force, the size of the potentials it is a difference of,
 (|A_L| + |A_R| + ρ^d(|B_L| + |B_R|))/dx): its force is not known better than that. The same bound decides release in
-the active set, and a face released and then blocked again with no step taken (α = 0) stays stuck for the rest of
-the step: such a pair of moves is degenerate at rounding and would otherwise repeat (observed: 400 iterations on a
-water pour, alternating one face in and out with an excess of 4e-12).
+the active set, and a face released and then blocked again before a feasible point is reached, twice (or once with
+no step to rounding, α ≤ 1e-12), stays stuck for the rest of the step: the minimiser over the smaller cone (u_f = 0)
+is still a constrained minimiser of the same convex Φ, so §5 holds, and degenerate cycles of release and block end
+(observed: 400 iterations on a water pour with an excess of 4e-12; 400 on a tapered flood on paper, α = 1e-19 and
+8e-4 alternating).
 
 *The constraint's share.* A saturated cell's multiplier λ_c ≥ 0 is the reaction against its outflow; its work
 dt dx² Σ_f λ_donor |U_f| is inside D_num (§5, "Constraints") and is reported apart (`D_num constraint`), together
@@ -229,6 +231,13 @@ or 1e-12 of the gross amount the fluxes carry through it (the flux-form update i
 known better; a 1e-21 m cell next to a 5e-6 m one could otherwise never converge). A Jacobian that is not finite,
 and a factorisation that fails, reject the substep (it halves); they never escape as errors.
 
+*The explicit potential of an entering substance* (an open defect). The concave part of mixing is smooth at
+q_i = 0, but a substance absent from a cell at the substep's start and allowed to enter it has its μ_x masked to 0
+together with the convex part (whose μ is −∞ there). The step then uses a force that is not F's: D_num's time part is
+negative where one pigment enters another paint (−8e-7 J against ΔF = −2e-13 J), and the receipt is flagged
+`solver`. Keeping μ_x finite fixes the sign but stalls the Newton iteration on another scene; not fixed yet
+(tests/world/test_world_painting.py, xfail).
+
 *Entry* (**R6**): a substance enters a neighbouring cell that lacks it only if, at e⁻³⁰ of the donor's
 fraction, the relative force at the old state still drives it in. Where it would not, its equilibrium
 share in that cell is below e⁻³⁰ of the donor's (uphill against strong drift, or against a solvent's
@@ -248,11 +257,15 @@ the constraint h ≥ 0, and ξ ≤ μ(h → 0⁺) is checked.
 **D_mech** of each mechanism is computed from the fluxes applied and the forces that drove them:
 
 ```text
-viscous     dt dx² Σ_f U_f² / (r M_f)            plastic   dt dx² Σ_f Y_f |U_f|
+viscous     dt dx² Σ_f |U_f| (o_f G_f − Y_f − λ_d)₊   plastic   dt dx² Σ_f Y_f |U_f|
 diffusion   dt dx² Σ_f Xᵀ r L X                  exchange  dx² Σ e²/(dt r k)       sorption  dx² Σ a²/(dt r κ)
 ```
 
-each a sum of non-negative terms, so D_mech ≥ 0 in floating point, not only in exact arithmetic. At
+each a sum of non-negative terms, so D_mech ≥ 0 in floating point, not only in exact arithmetic. The viscous term
+is written as flux times force, which equals U²/(rM) at the solution: U²/M overflowed (2.5e88 J) where M ~ 0 in a
+cell holding almost nothing at a running drop's edge, and D_num absorbed it with the opposite sign. A step whose
+time part of D_num is negative beyond 1e-12 of the energy moved (and the rounding of the F values) carries a
+`solver` flag under either solver; the transport part's sign is not established for a concave mixing (below). At
 the solution of each substep these equal Σ flux · force (U(G − cY) = U²/(rM), and the rest likewise).
 
 *Residual.* An operation's energy closure residual compares what it booked to `stored` with the change
