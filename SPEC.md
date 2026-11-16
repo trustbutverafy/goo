@@ -405,6 +405,7 @@ light                      goo/light/, tests/light/, docs/LIGHT.md              
 referee                    tests/contract/, tests/limits/, tests/oracle/, docs/NEGATIVE.md      after the first wave
 ports, journal, clocks     goo/ports/, goo/journal/, tests/ports/, tests/journal/, docs/PORTS.md, docs/JOURNAL.md   second wave
 lab and observers          goo/lab/, goo/observe/, tests/lab/, tests/observe/, docs/LAB.md, docs/OBSERVE.md   second wave
+performance                docs/PERFORMANCE.md, bench/ (prototypes and benchmarks; not part of the package)
 lead                       SPEC.md, AGENTS.md, README.md, goo/units.py, goo/evidence.py, goo/ledger.py, goo/film.py,
                            tests/test_shared.py, tests/test_layering.py, integration
 ```
