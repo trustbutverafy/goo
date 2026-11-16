@@ -2,7 +2,7 @@
 import numpy as np
 import scipy.sparse as sp
 from goo.world.linsolve import Factor, SolveFailed
-from goo.world.common import Reject, coeff, mixing, dF_grav, dF_cap, dF_wet, mu_wet
+from goo.world.common import Reject, coeff, mixing, mixing_potentials, dF_grav, dF_cap, dF_wet, mu_wet
 from goo.world.grid import capillary_pressure
 
 MAX_CLASS_ITER = 400
@@ -32,11 +32,12 @@ def flow(ctx, q, dt):
     m = ctx.rho @ q
     wet = h > 0
     rep = dict(D_viscous=0.0, D_plastic=0.0, dE=0.0, dF_mix=0.0, cells=np.zeros(0, np.int64),
-               faces=np.zeros(0, np.int64), D_constraint=0.0, D_wetting=0.0)
+               faces=np.zeros(0, np.int64), D_constraint=0.0, D_wetting=0.0, rest=False)
     wL, wR = wet[fL], wet[fR]
     cand = wL | wR
     rf = np.minimum(ctx.r[fL], ctx.r[fR])
     if not (cand & (rf > 0)).any():
+        rep["rest"] = True           # decided on the old state alone: the same for every dt (rest memo)
         return q, rep
     eta = coeff(ctx, "viscosity", q, None)
     if eta is None:
@@ -52,6 +53,7 @@ def flow(ctx, q, dt):
     M = np.where(cand, M, 0.0)
     allowp, allowm = wL & (M > 0), wR & (M > 0)
     if not (allowp | allowm).any():
+        rep["rest"] = True           # decided on the old state alone: the same for every dt (rest memo)
         return q, rep
     hf = np.where(both, 0.5 * (h[fL] + h[fR]), np.where(wL, h[fL], h[fR]))
     Y = np.zeros(G.nF)
@@ -93,6 +95,7 @@ def flow(ctx, q, dt):
     movp = allowp & np.where(Y > 0, G0p - Y > tolp, G0p > 0)
     movm = allowm & np.where(Y > 0, -G0m - Y > tolm, -G0m > 0)
     if not (movp | movm).any():
+        rep["rest"] = True           # decided on the old state alone: the same for every dt (rest memo)
         return q, rep
     o = _orient(G0p, G0m, allowp, allowm)
     mov = np.where(o > 0, movp, movm) & (o != 0)
@@ -306,7 +309,7 @@ def flow(ctx, q, dt):
     # O(dt^2) where the film is thicker than ell, O(1) where a cell crosses ell (the contact line moves a cell, which a
     # molecular ell does not resolve: DYNAMICS.md §9)
     Dw = max(0.0, -(dEw - dx ** 2 * float(np.sum(mu_wet(ctx, h[cells], cells) * dh[cells])))) if ctx.Swet is not None else 0.0
-    mx0, mx1 = mixing(ctx, q[:, cells]), mixing(ctx, qn[:, cells])
+    mx0, mx1 = mixing_potentials(ctx, q[:, cells]), mixing_potentials(ctx, qn[:, cells])
     dFmix = 0.0 if mx0 is None else dx ** 2 * np.sum((mx1[0] + mx1[3]) - (mx0[0] + mx0[3]))
     au = absU[act]
     # the reaction of the cells that gave all they held: its work dt dx^2 sum lam_donor |U| is the constraint's share

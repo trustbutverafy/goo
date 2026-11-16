@@ -32,6 +32,7 @@ dataclass. SI throughout; temperatures of reference values are `T_ref = goo.unit
 | `thermo.p_sat` | Pa | saturation vapour pressure at T_ref; volatile iff > 0 |
 | `thermo.dH_vap` | J/mol | enthalpy of vaporisation: Clausius-Clapeyron, and the DERIVED cohesive energy (dH_vap - R T) rho / M |
 | `thermo.cohesion` | J/m^3 | cohesive energy density of a non-volatile substance (Hildebrand parameter squared). Refused when derivable |
+| `thermo.cohesion_p`, `thermo.cohesion_h` | J/m^3 | its polar and hydrogen-bonding parts (Hansen's delta_p^2, delta_h^2); the dispersive part is the rest (derived). Given for both of two liquids, their interaction is the Hansen distance |
 | `thermo.gamma` | J/m^2 | surface tension against air (for a solid: its surface free energy) |
 | `thermo.gamma_d` | J/m^2 | the dispersive part of gamma (Owens-Wendt); gamma - gamma_d is the polar part. Gives wetting and capillary suction by the geometric-mean rule |
 | `thermo.D_vapour` | m^2/s | diffusivity of its vapour in air at T_ref |
@@ -39,8 +40,9 @@ dataclass. SI throughout; temperatures of reference values are `T_ref = goo.unit
 | `rheo.E_eta` | J/mol | viscous activation energy (Arrhenius) |
 | `rheo.separation` | m | closest approach of two particles; sets the attraction that gives a yield stress |
 | `rheo.phi_percolation` | 1 | volume fraction at which an attractive network first spans (YODEL's phi_0) |
+| `rheo.glass` | 1 | a binder's glass composition: the volume fraction of the other liquids around it at or below which its solution is a glass (viscosity +inf) |
 | `rheo.coupling` | as declared | Onsager matrix among the rates of the declared state variables |
-| `reactions` | kg/kg, 1/s, J/mol | `Reaction(stoich, rate, E_a)`: stoichiometry by mass (reactants negative), first-order rate at T_ref, activation energy |
+| `reactions` | kg/kg, 1/s, J/mol, J/kg | `Reaction(stoich, rate, E_a, dG, M_reservoir)`: stoichiometry by mass (reactants negative), first-order rate at T_ref, activation energy, free energy of reaction per kg of extent (film substances pure, reservoirs at activity 1, T_ref), molar masses of the reservoirs it draws. Provenance keys `reactions` and `reactions.dG` |
 | `reservoir` | J/m^3 | energy an impossible substance may draw; 0 for every admissible one |
 | `prov` | | a `Provenance` for every field and every given parameter, keyed `eps`, `morph`, `rho`, `reservoir`, `reactions`, `thermo.<p>`, `rheo.<p>`; missing or extra keys are refused |
 | `state` | | `StateVar(name, unit, lo, hi)` the substance declares (none in the library yet) |
@@ -49,10 +51,11 @@ dataclass. SI throughout; temperatures of reference values are `T_ref = goo.unit
 A parameter left `None` makes no claim and needs no provenance; maps that would need it mark the cells where the
 substance is present out of domain (or say what they do instead).
 
-The free-energy terms these give (per unit film volume): ideal mixing kT sum (phi_s / v_s) ln phi_s; Hildebrand-
-Scatchard interaction (1/2) sum B_ij phi_i phi_j with B_ij = (sqrt c_i - sqrt c_j)^2; capillarity through gamma;
-gravity through rho; exchange through p_sat. The dissipation terms: viscous (1/eta), yield (tau_y, flat Psi*),
-vapour transport (D_vapour), reactions (rate), coupling.
+The free-energy terms these give: the liquids' solution among the liquids alone (Flory-Huggins kT sum (q_l/v_l)
+ln(q_l/L) and the interaction (1/2) q_l^T B q_l / L, B Hansen or Hildebrand-Scatchard); the particles' ideal
+entropy kT sum (q_p/v_p) ln(q_p/h) and their excluded volume (§3a); capillarity through gamma; gravity through rho;
+exchange through p_sat; reactions through dG. The dissipation terms: viscous (1/eta, divergent at a binder's glass
+composition), yield (tau_y, flat Psi*), vapour transport (D_vapour), reactions (rate, Psi* = r m A_+), coupling.
 
 ## 2. Admissibility (`laws`)
 
@@ -61,8 +64,8 @@ Each predicate returns `Verdict(law, ok, shortfall, unit, detail, parts, method)
 | law | test | shortfall, unit |
 |---|---|---|
 | herglotz | oscillators of non-negative strength and width with eps_inf >= 1: proved. Else Im eps over the described range, and classic's finite-range Kramers-Kronig test (NNLS over every passive extension, remainder <= 2 %) | max(gain, remainder - 2 %), 1 |
-| stable | rho > 0, gamma >= 0, cohesion >= 0, M > 0, p_sat >= 0, d > 0, sigma_g >= 1 | the worst term's, in its unit |
-| dissipative | eta > 0, separation > 0, 0 <= phi_percolation < 1, D_vapour >= 0, rates >= 0, coupling's symmetric part PSD | the worst term's |
+| stable | rho > 0, gamma >= 0, cohesion >= 0 and its polar and hydrogen-bonding parts >= 0 with a dispersive rest >= 0, M > 0, p_sat >= 0, d > 0, sigma_g >= 1, the excluded-volume term convex (packing fraction > 2/15), dG finite, reservoir molar masses > 0 | the worst term's, in its unit |
+| dissipative | eta > 0, separation > 0, 0 <= phi_percolation < 1, 0 <= glass < 1, D_vapour >= 0, rates >= 0, dG < 0 where rate > 0 (runs downhill), coupling's symmetric part PSD | the worst term's |
 | reciprocal | coupling = coupling^T (isotropic eps and Hildebrand interaction: by construction) | max abs(L - L^T) / 2 |
 | stoichiometric | each reaction's coefficients sum to 0 (1e-12); the substance is a reactant | abs(net), kg/kg |
 
@@ -101,15 +104,15 @@ Empty cells return a stated convention and are in domain.
 | `surface(film, bands)` | `Surface(index [B,H,W], roughness [H,W] m)` | overbound: the liquid's index, roughness 0; underbound: the liquid recedes from the top; roughness of a hexagonal sphere monolayer standing out of a flat liquid (computed geometry) at the empty fraction min(1, V / (0.395 d32)); index Wiener-bounded | spheres, one liquid, liquids' eps described | assumed |
 | `ground_surface(ground, bands)` | `Surface(index, roughness)` | as `surface`, solid at 1 - porosity; the top is always a composite (Bounded); roughness 0 when the pores are full | solid with a morphology | assumed |
 | `density(film)` | rho [H,W] kg/m^3 | sum phi_s rho_s (volumes add) | always; empty: 0 | assumed (SPEC §3) |
-| `viscosity(film)` | eta [H,W] Pa s | liquids log-mixed, Arrhenius in T; Krieger-Dougherty with [eta] = 5/2 and phi_m from `packing`, phi = P / (P + L) | not jammed (else inf); a liquid (powder: inf); eta given; miscible; E_eta where T != T_ref | computed (assumed with two liquids) |
+| `viscosity(film)` | eta [H,W] Pa s | liquids log-mixed, Arrhenius in T, times exp(y_b s_g / (s - s_g)) per binder with a glass composition s_g (s its solvent fraction), +inf at s <= s_g; Krieger-Dougherty with [eta] = 5/2 and phi_m from `packing`, phi = P / (P + L) | not jammed (else inf); not a glass (else inf); a liquid (powder: inf); eta given; miscible; E_eta where T != T_ref | computed (assumed with two liquids) |
 | `yield_stress(film)` | tau_y [H,W] Pa, `Bounded` | YODEL form, prefactor 1: G(phi) sum x_s A_s / (12 H_s^2 d32_s); Hamaker by Tabor-Winterton from eps at 589 nm, lo without and hi with the zero-frequency 3kT/4 | `yield_stress_domain(film)`: not jammed, a liquid, no voids, phi_percolation given | assumed |
 | `packing(film)` | phi_m [H,W] | Desmond & Weeks on the number distribution of every population present | polydispersity <= 0.6, spheres; no particles: 0.634 | computed |
 | `diffusivity(film)` | D [S,H,W] m^2/s | particles: kT E_n[1/d] / (3 pi eta_film); molecules: kT / (6 pi eta_l r_mol) | the viscosity's; molecules always out | computed |
 | `settling(film)` | v [S,H,W] m/s along g at g_0 | Stokes with E_v[d^2], Richardson-Zaki (1-phi)^4.65; envelope density | Re < 0.1, a liquid, its viscosity | computed |
-| `chemical_potential(film)` | mu [S,H,W] J/m^3 | Flory-Huggins plus Hildebrand-Scatchard; mu = d(h f)/dq | always (the model F itself); absent: -inf | assumed |
+| `chemical_potential(film)` | mu [S,H,W] J/m^3 | mu + mu_x of `mixing` (§3a): a liquid's includes minus the particles' osmotic pressure | always (the model F itself); absent: -inf | assumed |
 | `surface_tension(film)` | gamma [H,W] J/m^2 | liquids' gamma weighted by volume among liquids | gamma given, a liquid present | exact for one liquid, assumed for more |
 | `evaporation(film, env)` | {name: `Exchange(activity, activity_env, rate, p_sat)`} | a = exp(mu v / kT); J = rate (a - a_env), rate = D_v M p_sat(T) / (R T delta); Clausius-Clapeyron; D_v ~ T^1.75 | dH_vap where T != T_ref, D_vapour given | assumed |
-| `reactions(film, env)` | [`ReactionRate(substance, reaction, rate)`], rate [H,W] 1/s | Arrhenius, times env activities of reactants the film lacks | every product a substance of the film | assumed |
+| `reactions(film, env)` | [`ReactionRate(substance, reaction, rate, affinity)`], rate [H,W] 1/s, affinity [H,W] J per kg of extent | rate: Arrhenius, times env activities of reactants the film lacks; affinity A = -dG - sum nu_i mu_i / rho_i - sum nu_res (RT/M_res) ln a_res (an absent film substance's -inf term left out: A a finite lower bound) | every product a substance of the film; for A: dG and M_res given, T = T_ref | assumed |
 
 The environment is `goo.film.Environment` (read duck-typed: `.T`, `.activity`, `.boundary_layer`);
 `maps.Atmosphere` is a stand-in with the same field names.
@@ -120,8 +123,10 @@ would not unpack there).
 
 | map | returns | model |
 |---|---|---|
-| `mixing(film, T)` | `MixingTerms(f, mu, hess, f_x, mu_x)`; J/m^2, J/m^3, J/m^4 | F_mix = h f_v: Flory-Huggins entropy (convex: the perspective of sum c x ln x) plus the Hildebrand interaction (1/2) q^T B q / h, split with beta = max eig B: convex part = entropy + (beta/2)(q^T q / h - h), concave part = (1/2) q^T (B - beta I) q / h + (beta/2) h. A pure substance has 0 in each; mu = -inf and hess = 0 where a substance is absent |
-| `mobility(film)` | Lambda [S,H,W] m^2/(Pa s) | D v / (k_B T) from `diffusivity` (for spheres d^2 / (18 eta)) |
+| `mixing(film, T)` | `MixingTerms(f, mu, hess, f_x, mu_x)`; J/m^2, J/m^3, J/m^4 | §3a. Liquids among themselves (Flory-Huggins, Hansen/Hildebrand interaction split with beta = max eig B over the film's liquids: convex (beta/2)(q_l^T q_l / L - L), concave (1/2) q_l^T (B - beta I) q_l / L + (beta/2) L); particles' ideal entropy and excluded volume (convex). A pure substance and a dry powder have 0 in each; mu = -inf and hess = 0 where a substance with a mixing unit is absent |
+| `mixing_potentials(film, T)` | `MixingTerms(f, mu, None, f_x, mu_x)` | `mixing`'s arrays bit for bit, no Hessian (about 0.6 of the cost) |
+| `mixing_hvp(film, dq, T)` | [S,H,W] J/m^3 | the convex Hessian applied to dq [S,H,W] per cell, without forming [S,S,H,W] |
+| `mobility(film)` | Lambda [S,H,W] m^2/(Pa s) | D v / (k_B T) from `diffusivity` (for spheres d^2 / (18 eta)); 0 where the film is jammed or its liquid a glass |
 | `exchange(film, env)` | `ExchangeRates(k [S,H,W] m/(Pa s), mu_env [S] J/m^3, activity [S,H,W])` | mu_env = (k_B T / v) ln a_env for a volatile the environment names; k = (R / rho)(a - a_env)/(mu - mu_env), the secant of the boundary-layer law R = D_v M p_sat / (R_gas T delta) at the present state, so the flux there is exact; near equilibrium k = D_v M^2 p_sat a / (delta rho^2 (R_gas T)^2). a_env = 0 gives mu_env = -inf and k = 0, out of domain |
 | `wetting(film, ground)` | `Wetting(S, ell)` [H,W] | S = 2 sqrt(gd_s gd_l) + 2 sqrt(gp_s gp_l) - 2 gamma_l (<= 0; complete wetting reported as 0); ell = sqrt(abs(A) / (12 pi abs(S))), A by Tabor-Winterton for solid / liquid / air, at least the molecular length |
 | `sorption(film, ground)` | `Sorption(P, kappa)` [S,H,W] | per liquid substance: P = 2 gamma cos theta / r, cos theta from its own spreading coefficient on the ground's solid, 0 when non-wetting or the pores are full; kappa = porosity r^2 / (8 eta L), Lucas-Washburn with L = max(held / porosity, r) |
@@ -154,6 +159,66 @@ mid-points, as a fraction of the band's largest S (and K against the larger of t
 
 Large particles carry Mie's ripple in the host index; the grid would have to be finer for them. K >= 0 and S >= 0
 are imposed after interpolation where they are theorems (passive particles; every S).
+
+## 3a. Particles, binders and reactions in the free energy
+
+**Particles are not solutes.** Flory-Huggins applied to particles gave each one the entropy of a chain of lattice
+sites, so water's potential in a suspension carried kT/v_w ln phi_w: a particle's diagonal stiffness Lambda_p H_pp
+was ~1e-4 m^2/s, a dried particle film held ~23 % water at 50 % RH, and the interdiffusion of water and particles
+in the world's Onsager matrix ran at water's molecular rate (~1e-9 m^2/s, 300-2300 x Stokes-Einstein). Now
+(goo/substance/_freeenergy.py):
+
+- *Liquids* mix among themselves only: Flory-Huggins on the liquid fractions, with the interaction energy density
+  B_ij the Hansen distance (Delta d^2 + Delta p^2 / 4 + Delta h^2 / 4; the form Lindvig, Michelsen & Kontogeorgis
+  2002 use in Flory-Huggins, recalled: assumed) where both liquids give polar and hydrogen-bonding parts, else
+  Hildebrand-Scatchard. Water and ethanol (Hansen parts read in Accu Dyne's table of Hansen 2007): B = 1.46e8
+  J/m^3 against the critical 1.63e8, one phase at every proportion. Hildebrand gave 4.8e8: hydrogen bonds that both
+  liquids make were counted as a cost of mixing.
+- *Particles* carry their ideal entropy kT (q_p/v_p) ln(q_p/h) (per volume ~1e-8 of a molecular liquid's) and an
+  excluded-volume term per population against the liquid it sits in, with Z = 1 + 4x(1 + a x)/(1 - x/phi_m),
+  a = 5/2 - 1/phi_m: exact to the third virial coefficient, within 4 % of Carnahan-Starling to x = 0.3 and 11 % at
+  0.5, diverging as (phi_m - x)^-1 at the population's own packing fraction (Desmond & Weeks on its size
+  distribution), as free-volume theory has it and as Kamien & Liu (PRL 99, 155501, 2007; arXiv cond-mat/0701343,
+  read 2026-11-15) fit the metastable branch. The osmotic pressure is followed until it reaches the menisci's
+  Laplace pressure at the pores, Pi_e = gamma 6 phi_m / ((1 - phi_m) d32) (hydraulic radius of the packed bed,
+  perfect wetting, gamma the largest of the film's liquids': 3.5 MPa for rutile in water): beyond, voids open, the
+  term is linear and the liquid's potential is -Pi_e. A dry powder has zero mixing energy. Each population sees the
+  liquid only (not the other populations): the term is then convex by construction (a sum of perspectives); a
+  number-weighted excess over a polydisperse mixture is not convex (tested while choosing). In a mixture of
+  populations this underestimates the osmotic pressure; the jam is still found by the viscosity at the mixture's
+  packing.
+- *Collective diffusivity* implied by the maps in the solvent's frame, D_c = h Lambda_p phi_p (H_pp - 2 H_pl + H_ll)
+  = D_SE (eta_l/eta) (phi Z)': 1.06, 2.5, 5.7 x Stokes-Einstein at 1, 20, 45 % for rutile; <= 25 x up to 0.64; it
+  grows as (phi_m - phi)^-0.36 toward packing (the consolidation of an incompressible bed is fast) to 700 x
+  (rutile) - 3.4e3 x (20 um cellulose) at the entry point; exactly 0 at and above packing (jammed). In goo.world's
+  diffusion matrix L = diag(omega) - omega omega^T / sum omega (omega_i = h Lambda_i phi_i) the particle-water pair
+  moves at omega_p omega_w / (omega_p + omega_w) ~ omega_w (water's molecular mobility, 1e5 x smaller): the world
+  sees D_c ~ 1e-16 m^2/s. Stiffness is gone; particle diffusion is then slower than real (reported to dynamics).
+- *Dried films.* A particle holds no water. At 50 % RH a film of particles in water dries completely (activity
+  of the water left in the pores exp(-Pi_e v_w / kT) = 0.97 > 0.5 for any amount); gum arabic holds what its
+  isotherm says, 13.5 g per 100 g (volume fraction 0.159); with pigment and enough gum to fill the pores, the same,
+  to 1e-6; with too little gum (voids), 4 % more (the menisci's suction).
+
+**Binders vitrify.** `rheo.glass` = s_g: a binder whose solvent fraction s (every other liquid) is at or below s_g is
+a glass, viscosity +inf (goo.world's settle() retires it, mobility 0); above, the log-mixed viscosity carries
+exp(y_b s_g / (s - s_g)) (Doolittle's free-volume form with the free volume proportional to the solvent in excess
+of the glass composition: x1.1 at a 30 % gum solution, divergent at s_g). Gum arabic: s_g = 0.194 (guessed: the
+water fraction at which its solution theory gives a = 0.575, maltodextrin's critical water activity at 25 C, J.
+Appl. Glycosci. 71(1) 2024, Table 1; no Tg(water) data for gum arabic found). A gum film at 50 % RH (0.159) is a
+glass. Linoxyn: s_g = 0.5 (guessed gel point: a cured oil film stops flowing when half its liquid is linoxyn).
+Gum arabic's cohesive energy is now derived from its measured isotherm (chi = 0.43; it was a guess chosen for
+miscibility, chi = 0.12, which gave 22 % water at 50 % RH).
+
+**Reactions have a free energy.** `Reaction.dG` (J per kg of extent; film substances pure, reservoirs at activity 1,
+T_ref) and `M_reservoir`. `reactions(film, env)` returns the affinity A = -dG - sum_i nu_i mu_i/rho_i - sum_res
+nu_res (RT/M_res) ln a_res, J per kg of extent, with the rate: Psi* = r m A_+ reproduces the first-order rate where
+A > 0 and stops at A <= 0. Linseed oil's cure: dG = -1.1 MJ/kg (guessed: ~-300 kJ per mol of O2, Thornton's rule
+recalled), A = 1.09 MJ/kg in air. `dissipative` fails a reaction that runs with dG >= 0.
+
+**Cost.** Each distinct (volume fractions, T) is solved once (64-bit hash of the bits, verified exactly), on the
+substances present in it (presence patterns); Hessians are written without cancellation (exactly 0 for one
+component). 256 x 256 cells, 11 substances, 4 present: `mixing` 0.27 s before, 0.08-0.10 s now;
+`mixing_potentials` 0.06 s; one composition everywhere < 0.05 s.
 
 ## 4. The library
 
@@ -231,8 +296,14 @@ crystals, not the ordinary ray as classic/docs/MATTER.md says.
 - Yield: YODEL's prefactor taken as 1; nu_e = 3e15 Hz; separations and percolation onsets assumed.
 - Liquid viscosity mixing (Arrhenius), surface tension mixing (linear): assumed.
 - Molecular Stokes-Einstein: out of domain by construction.
-- **Negative:** the regular solution (Hildebrand) predicts water and ethanol separate (B = 4.8e8 J/m^3 against a
-  critical 1.6e8); they mix in all proportions. Hydrogen bonding is not in the description. The test is `xfail`.
+- Hansen-form interaction in Flory-Huggins (assumed); Hildebrand where a liquid gives no Hansen parts (gum
+  arabic, the oils). The excluded volume of a mixture of populations: each population against the liquid alone.
+- The capillary entry pressure: perfect wetting, the hydraulic radius of the packed bed, the largest surface tension
+  among the film's liquids (so the function does not change from cell to cell). Its suction is counted once per
+  population present (overcounted in mixtures; it is << kT/v of any molecular liquid).
+- Vitrification: Doolittle-like divergence with coefficient 1 (assumed); s_g guessed for gum arabic and linoxyn.
+- **Resolved:** the regular solution (Hildebrand) predicted water and ethanol separate; the Hansen split does not.
+- **Resolved:** particle films held ~23 % water at 50 % RH (Flory-Huggins on particles); they now dry completely.
 - **Negative:** under SPEC §4.2 as written, with sizes assumed (§4.5) and k = 0 assumed for transparent-range
   sources, no particle substance in the library is real.
 
@@ -249,3 +320,11 @@ expm1(-dh/ell) = inf; a strict xfail keeps the case. Found on the way and fixed 
 exactly 0 (c phi, not c q / h), or the world's one-substance diffusion becomes singular; an empty cell needs a
 surface tension, or the world's capillary stabilisation fails where liquid arrives; the suction must not depend on
 whether the cell's film is present, or the lagged pore term changes when a film drains.
+
+What the new mixing (§3a) shows the world (measured 2026-11-15, the world unchanged): the two-paints-meet test now
+passes (a particle has no concave potential, so masking an entering particle's mu_x to 0 is exact); a gum-water
+hematite film on paper settles by law after 240 s (756 cells retired: the gum vitrifies); and a cell holding a
+particle and a trace of water fails the local step (goo/world/local.py:252, "negative amount", 24 halvings), because
+its water now drains completely (its potential is bounded below by the menisci's -Pi_e, far above the air's) and
+the drain rule there handles single-substance cells only.
+

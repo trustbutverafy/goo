@@ -15,7 +15,7 @@ Particle sizes are assumed (SPEC §4.5), except rutile's, which is checked again
 (classic/docs/OPTICS-DATA.md check 2).
 """
 import numpy as np
-from goo.units import um, nm, mPa_s, kPa, mN, R_gas, T_room, celsius
+from goo.units import um, nm, mPa_s, kPa, mN, R_gas, T_room, celsius, k_B
 from goo.evidence import Provenance as P
 from goo.substance.description import Substance, Thermo, Rheo, Reaction
 from goo.substance.dielectric import Oscillators, Lorentz, Gauss, Free, from_source, eV, HC
@@ -32,6 +32,9 @@ IAPWS = "IAPWS releases (International Association for the Properties of Water a
 NIST = "NIST Chemistry WebBook, NIST Standard Reference Database 69"
 CRC = "CRC Handbook of Chemistry and Physics"
 SRC = D.SOURCES
+HANSEN = ("Accu Dyne Test, Solubility parameters table (accudynetest.com/solubility_table.html), values from C. M. "
+          "Hansen, Hansen Solubility Parameters: A User's Handbook, 2nd ed. (CRC 2007), at 25 C, read 2026-11-15 "
+          "(used at 20 C): ")
 
 
 def _eps_prov(*keys, note=""):
@@ -73,7 +76,8 @@ def _add(s):
 # ------------------------------------------------------------------------------- (b) liquids, real and otherwise
 WATER = _add(Substance(
     "water", from_source([(SRC["water"], 1.0)]), None, 998.207,
-    Thermo(M=18.0153e-3, p_sat=2.3393 * kPa, dH_vap=44.20e3, gamma=72.74 * mN, gamma_d=21.8 * mN, D_vapour=2.42e-5),
+    Thermo(M=18.0153e-3, p_sat=2.3393 * kPa, dH_vap=44.20e3, gamma=72.74 * mN, gamma_d=21.8 * mN, D_vapour=2.42e-5,
+           cohesion_p=(16.0e3) ** 2, cohesion_h=(42.3e3) ** 2),
     Rheo(eta=1.0016 * mPa_s, E_eta=_E_eta(1.0016 * mPa_s, T_room, 0.890022 * mPa_s, celsius(25.0))),
     material="liquid water",
     prov=dict(
@@ -86,6 +90,8 @@ WATER = _add(Substance(
            "thermo.dH_vap": P("checked", f"{NIST_WATER}: saturation table at 19.953 C, vapour 45.711 - liquid "
                                          "1.508 kJ/mol = 44.20 kJ/mol", CITE),
            "thermo.gamma": P("checked", f"{NIST_WATER}: saturation table, 0.072743 N/m at 19.953 C", CITE),
+           "thermo.cohesion_p": P("checked", HANSEN + "water: delta_p 16.0 MPa^0.5", CITE),
+           "thermo.cohesion_h": P("checked", HANSEN + "water: delta_h 42.3 MPa^0.5", CITE),
            "thermo.gamma_d": P("checked", "Accu Dyne Test, Surface Tension Components and Molecular Weight of "
                                           "Selected Liquids (accudynetest.com/surface_tension_print.html), water: "
                                           "72.8 total, 21.8 dispersive, 51.0 polar mN/m (Wu 1982 gives 22.1-22.6), "
@@ -100,7 +106,8 @@ WATER = _add(Substance(
 
 ETHANOL = _add(Substance(
     "ethanol", from_source([(SRC["ethanol"], 1.0)]), None, 789.45,
-    Thermo(M=46.0684e-3, p_sat=5.87 * kPa, dH_vap=42.3e3, gamma=22.39 * mN, gamma_d=19.7 * mN, D_vapour=1.2e-5),
+    Thermo(M=46.0684e-3, p_sat=5.87 * kPa, dH_vap=42.3e3, gamma=22.39 * mN, gamma_d=19.7 * mN, D_vapour=1.2e-5,
+           cohesion_p=(8.8e3) ** 2, cohesion_h=(19.4e3) ** 2),
     Rheo(eta=1.200 * mPa_s, E_eta=_E_eta(1.200 * mPa_s, T_room, 1.074 * mPa_s, celsius(25.0))),
     material="ethanol",
     prov=dict(
@@ -114,6 +121,8 @@ ETHANOL = _add(Substance(
                                         "5.851 kPa)", CITE),
            "thermo.dH_vap": P("checked", f"{NIST}, ethanol: Delta_vap H = 42.3 +- 0.4 kJ/mol at standard conditions "
                                          "(298 K; used at 20 C)", CITE),
+           "thermo.cohesion_p": P("checked", HANSEN + "ethanol: delta_p 8.8 MPa^0.5", CITE),
+           "thermo.cohesion_h": P("checked", HANSEN + "ethanol: delta_h 19.4 MPa^0.5", CITE),
            "thermo.gamma": P("assumed", note="22.39 mN/m at 20 C recalled, not read; Engineering ToolBox gives 21.97 "
                                              "mN/m at 25 C, consistent with a slope of -0.08 mN/m/K. Check against "
                                              "the CRC Handbook's surface-tension table"),
@@ -133,7 +142,8 @@ LINSEED = _add(Substance(
     "linseed_oil", _n_d_oscillator(LINSEED_N_D), None, 930.0,
     Thermo(M=0.872, cohesion=(17.5e3) ** 2, gamma=33.0 * mN, gamma_d=30.0 * mN),
     Rheo(eta=50 * mPa_s, E_eta=35e3),
-    reactions=(Reaction((("linseed_oil", -1.0), ("oxygen", -0.12), ("linoxyn", 1.12)), rate=5.8e-6, E_a=60e3),),
+    reactions=(Reaction((("linseed_oil", -1.0), ("oxygen", -0.12), ("linoxyn", 1.12)), rate=5.8e-6, E_a=60e3,
+                        dG=-1.1e6, M_reservoir=(("oxygen", 31.998e-3),)),),
     material="",
     prov=dict(
         eps=P("assumed", note=f"one UV oscillator at 10 eV with strength derived for n_D = {LINSEED_N_D} (measured "
@@ -142,6 +152,12 @@ LINSEED = _add(Substance(
         reservoir=NONE,
         reactions=P("guessed", note="oxidative cure: takes up ~12 % of its mass in oxygen; half-life ~1.4 days at "
                                     "20 C; activation energy guessed"),
+        **{"reactions.dG": P("guessed", note="free energy of the cure, -1.1 MJ per kg of extent (0.12 kg = 3.75 mol of "
+                                             "O2 per kg): ~-300 kJ per mol of O2, taken as ~70 % of the ~-440 kJ per "
+                                             "mol of O2 that organic combustion releases (Thornton's rule, recalled, "
+                                             "not read); the oxidation is far from equilibrium, so only its sign "
+                                             "matters to the dynamics. O2 molar mass 31.998 g/mol (assumed, "
+                                             "recalled)")},
         **{"thermo.M": P("assumed", note="a triglyceride of linolenic, linoleic and oleic acids, ~872 g/mol"),
            "thermo.cohesion": P("guessed", note="Hildebrand parameter 17.5 MPa^0.5, typical of vegetable oils"),
            "thermo.gamma": P("assumed", note="vegetable oils 32-35 mN/m at 20 C"),
@@ -151,19 +167,58 @@ LINSEED = _add(Substance(
 
 LINOXYN = _add(Substance(
     "linoxyn", _n_d_oscillator(1.50), None, 1050.0,
-    Thermo(cohesion=(18.5e3) ** 2), Rheo(eta=1e8),
+    Thermo(cohesion=(18.5e3) ** 2), Rheo(eta=1e8, glass=0.5),
     prov=dict(eps=P("guessed", note="cured oil, n_D ~1.50"), rho=P("guessed"), reservoir=NONE,
               **{"thermo.cohesion": P("guessed"), "rheo.eta": P("guessed", note="a rubbery solid: 1e8 Pa s stands "
-                                                                                "for 'does not flow on a painting's time')")})))
+                                                                                "for 'does not flow on a painting's time')"),
+                 "rheo.glass": P("guessed", note="a crosslinked network: it stops flowing (its gel point) once the "
+                                                 "uncured oil around it is half the liquid or less")})))
 
+def _fh_chi(phi_w, a_w):
+    """Flory-Huggins chi of a solvent in a macromolecular phase (v = inf) that holds solvent volume fraction phi_w
+    at solvent activity a_w: ln a = ln phi + (1 - phi) + chi (1 - phi)^2."""
+    return (np.log(a_w) - np.log(phi_w) - (1 - phi_w)) / (1 - phi_w) ** 2
+
+
+def _fh_phi(chi, a_w):
+    """The solvent volume fraction at activity a_w for a given chi (bisection on the monotone FH isotherm)."""
+    lo, hi = 1e-12, 1 - 1e-12
+    for _ in range(200):
+        m = 0.5 * (lo + hi)
+        if np.log(m) + (1 - m) + chi * (1 - m) ** 2 < np.log(a_w):
+            lo = m
+        else:
+            hi = m
+    return 0.5 * (lo + hi)
+
+
+GA_RHO = 1400.0
+GA_EMC = 0.135                   # kg water per kg dry gum at 50 % RH (Ahmed & Abdelgadir 2014, 30 C regression)
+_GA_PHI = (GA_EMC / WATER.rho) / (GA_EMC / WATER.rho + 1 / GA_RHO)
+GA_CHI = _fh_chi(_GA_PHI, 0.5)
+_GA_B = GA_CHI * k_B * T_room / WATER.molecular_volume
+GA_COHESION = (np.sqrt(WATER.cohesion) - np.sqrt(_GA_B)) ** 2
+GA_GLASS = _fh_phi(GA_CHI, 0.575)
 GUM_ARABIC = _add(Substance(
-    "gum_arabic", _n_d_oscillator(1.50), None, 1400.0,
-    Thermo(cohesion=(44e3) ** 2), Rheo(eta=5e3),
+    "gum_arabic", _n_d_oscillator(1.50), None, GA_RHO,
+    Thermo(cohesion=GA_COHESION), Rheo(eta=5e3, glass=GA_GLASS),
     prov=dict(eps=P("guessed", note="dry gum film n_D ~1.47-1.53"), rho=P("guessed", note="1.35-1.49 g/cm^3"),
               reservoir=NONE,
-              **{"thermo.cohesion": P("guessed", note="chosen so that the regular solution makes it miscible with "
-                                                      "water (a polysaccharide: no M, macromolecular)"),
-                 "rheo.eta": P("guessed", note="chosen so that a 30 % solution log-mixes to ~0.1 Pa s")})))
+              **{"thermo.cohesion": P("assumed", "Z. A. A. Ahmed, A. Y. Abdelgadir, Moisture desorption and adsorption "
+                                      "characteristics of gum arabic from Acacia senegal and A. seyal, U. of Khartoum J. "
+                                      "Agric. Sci. 22(2) 2014 (onlinejournals.uofk.edu, read 2026-11-15): their 30 C "
+                                      "adsorption regression for A. senegal gives 13.5 g water per 100 g dry gum at "
+                                      "50 % RH", CITE,
+                                      f"a polysaccharide: no M (macromolecular). Cohesion derived so that Flory-Huggins "
+                                      f"with Hildebrand's interaction against water holds that much water at a = 0.5 "
+                                      f"(volume fraction {_GA_PHI:.3f}, chi = {GA_CHI:.3f}; the 30 C value used at 20 C)"),
+                 "rheo.eta": P("guessed", note="chosen so that a 30 % solution log-mixes to ~0.1 Pa s; for the dry gum "
+                                               "an extrapolation parameter (the pure gum is a glass)"),
+                 "rheo.glass": P("guessed", "critical water activity 0.575 at 25 C of maltodextrin, a carbohydrate "
+                                 "glass taken as a stand-in (J. Appl. Glycosci. 71(1), 2024, Table 1, read "
+                                 "2026-11-15; no Tg(water) data for gum arabic found)", CITE,
+                                 f"the water volume fraction {GA_GLASS:.3f} at which gum arabic's solution theory gives "
+                                 "a = 0.575: below it the solution is taken to be a glass at 20 C")})))
 
 PMMA = _add(Substance(
     "pmma", from_source([(SRC["pmma"], 1.0)]), None, 1180.0, material="poly(methyl methacrylate)",
@@ -281,9 +336,10 @@ NEGATIVE_FRICTION = _add(Substance(
 ))
 MASS_FROM_NOTHING = _add(Substance(
     "mass_from_nothing", _n_d_oscillator(1.40), None, 1000.0, Thermo(gamma=30 * mN), Rheo(eta=1.0 * mPa_s),
-    reactions=(Reaction((("mass_from_nothing", -1.0), ("water", 1.5)), rate=1e-3),),
+    reactions=(Reaction((("mass_from_nothing", -1.0), ("water", 1.5)), rate=1e-3, dG=-1e3),),
     prov=dict(eps=P("guessed"), rho=P("guessed"), reservoir=P("exact", note="mass cannot be bought with energy"),
               reactions=P("guessed", note="1 kg becomes 1.5 kg of water"),
+              **{"reactions.dG": P("guessed", note="-1 kJ per kg of extent: downhill, so that only stoichiometry fails")},
               **{"thermo.gamma": P("guessed"), "rheo.eta": P("guessed")}),
 ))
 

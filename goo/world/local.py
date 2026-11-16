@@ -1,10 +1,12 @@
 """Substep 3: exchange with the atmosphere and sorption into the ground, cell by cell (DYNAMICS.md §4.3)."""
 import numpy as np
-from goo.world.common import Reject, coeff, mixing, dF_grav, dF_cap, dF_wet, dF_exch, mu_wet, pore_B
+from goo.world.common import Reject, coeff, mixing, mixing_potentials, dF_grav, dF_cap, dF_wet, dF_exch, mu_wet, pore_B
 from goo.world.grid import capillary_pressure
+from goo.world.kernels import local_newton_update
 
 MAX_NEWTON = 80
 BISECT = 80         # halvings of a bracket: to the last bits of a double
+DRAIN_EPS = 1e-12   # a cell's last amount of a substance is drained when its residual is >= 0 at this share of it
 
 
 def local(ctx, q, held, dt):
@@ -12,10 +14,11 @@ def local(ctx, q, held, dt):
     G = ctx.grid
     dx, N = G.dx, G.N
     S = q.shape[0]
-    rep = dict(D_exchange=0.0, D_sorption=0.0, dF=0.0, e=np.zeros(S), a=np.zeros(S), cells=np.zeros(0, np.int64), drained=0)
+    rep = dict(D_exchange=0.0, D_sorption=0.0, dF=0.0, e=np.zeros(S), a=np.zeros(S), cells=np.zeros(0, np.int64), drained=0, rest=False)
     h = q.sum(0)
     wet = (h > 0) & (ctx.r > 0)
     if not wet.any():
+        rep["rest"] = True
         return q, held, rep
     ex = coeff(ctx, "exchange", q, None, ctx.env)
     k = None if ex is None else ex[0]
@@ -29,11 +32,13 @@ def local(ctx, q, held, dt):
     if k is not None:
         eon = (k > 0) & (q > 0) & wet & ctx.has_env[:, None]
     if eon is None and son is None:
+        rep["rest"] = True
         return q, held, rep
     eon = np.zeros((S, N), bool) if eon is None else eon
     son = np.zeros((S, N), bool) if son is None else son
     cells = np.flatnonzero((eon | son).any(0))
     if cells.size == 0:
+        rep["rest"] = True
         return q, held, rep
     n = cells.size
     gx, gy, gn = ctx.g
@@ -74,14 +79,14 @@ def local(ctx, q, held, dt):
         if not nonmix:
             mm = ~sg
             if mm.all():
-                mxx = mixing(ctx, qp)
+                mxx = mixing(ctx, qp) if need_hess else mixing_potentials(ctx, qp)
                 mu_c, Hm = mxx[1], (mxx[2] if need_hess else None)
             else:
                 mu_c = mx0[1][:, idx].copy()
                 if need_hess:
                     Hm = mx0[2][:, :, idx].copy()
                 if mm.any():
-                    mxx = mixing(ctx, qp[:, mm])
+                    mxx = mixing(ctx, qp[:, mm]) if need_hess else mixing_potentials(ctx, qp[:, mm])
                     mu_c[:, mm] = mxx[1]
                     if need_hess:
                         Hm[:, :, mm] = mxx[2]
@@ -105,7 +110,44 @@ def local(ctx, q, held, dt):
         return th, mup, Jp
 
     e = np.zeros((S, n)); av = np.zeros((S, n))
-    live = np.flatnonzero(~single)                 # single-substance cells are bracketed below
+    # A cell of several substances in which one substance alone exchanges or is sorbed, and the step would take all of
+    # it (a particle film's last water: its potential is bounded below by the menisci's -Pi_e, far above the air's):
+    # with the other amounts fixed the residual q_i' - q0_i + e_i(q_i') + a_i(q_i') is increasing in q_i' (as for a
+    # single-substance cell), so if it is >= 0 at q_i' = DRAIN_EPS q0_i the root lies within that of zero and the
+    # constrained solution is the drain q_i' = 0 (the KKT point of q_i >= 0), split between e and a below like a
+    # single-substance cell's (DYNAMICS.md §4.3). The Newton would only creep toward 0 by its 0.9 limiter.
+    movers = Eon | Son
+    dsub = np.argmax(movers, axis=0)
+    mdrain = np.zeros(n, bool)
+    cand = np.flatnonzero(~single & (movers.sum(0) == 1))
+    if cand.size:
+        ic = dsub[cand]; kc = np.arange(cand.size)
+        T = q0[ic, cand]
+        # mu_i is increasing in q_i: at q0 it bounds what the step can take from above (one map call, no Hessian)
+        mu_hi = potentials(q0[:, cand], cand, need_hess=False)[0][ic, kc]
+        th0 = w0[cand] / C if C > 0 else np.zeros(cand.size)
+        mup0 = -P[ic, cand] + Pb[cand] * th0 / (1 - th0)
+        upper = (np.where(Eon[ic, cand], np.maximum(ke[ic, cand] * (mu_hi - menv[ic]), 0.0), 0.0)
+                 + np.where(Son[ic, cand], np.maximum(ks[ic, cand] * (mu_hi - mup0), 0.0), 0.0))
+        pre = upper >= T
+        if pre.any():
+            c2, i2, k2 = cand[pre], ic[pre], kc[pre]
+            T2 = T[pre]
+            qe = q0[:, c2].copy()
+            qe[i2, np.arange(c2.size)] = DRAIN_EPS * T2
+            mu_e = potentials(qe, c2, need_hess=False)[0][i2, np.arange(c2.size)]
+            ee0 = np.where(Eon[i2, c2], ke[i2, c2] * (mu_e - menv[i2]), 0.0)
+            aa0 = np.zeros(c2.size)
+            if C > 0 and np.any(Son[i2, c2]):
+                lo_, hi_ = np.zeros(c2.size), (C - w0[c2]) * (1 - 1e-12)
+                for _ in range(BISECT):
+                    mid = 0.5 * (lo_ + hi_)
+                    thm = (w0[c2] + mid) / C
+                    gm = mid - ks[i2, c2] * Son[i2, c2] * np.maximum(mu_e - (-P[i2, c2] + Pb[c2] * thm / (1 - thm)), 0.0)
+                    lo_, hi_ = np.where(gm < 0, mid, lo_), np.where(gm < 0, hi_, mid)
+                aa0 = lo_
+            mdrain[c2] = DRAIN_EPS * T2 - T2 + ee0 + aa0 >= 0
+    live = np.flatnonzero(~single & ~mdrain)        # single-substance cells are bracketed below; drained ones too
     # the unknowns: e_i for the substances that exchange somewhere in the solve, a_i for those that are sorbed
     # somewhere (every other e_i, a_i is identically zero, a row of the identity, and is left out of the system)
     ie = np.flatnonzero(Eon[:, live].any(1)) if live.size else np.zeros(0, np.int64)
@@ -114,6 +156,7 @@ def local(ctx, q, held, dt):
     if K == 0:
         live = live[:0]
     IK = np.eye(K)
+    elo, ehi = np.full(n, -np.inf), np.full(n, np.inf)      # the scalar Newton's brackets (kernels.py)
     gJ = np.asarray(gJ)
     for it in range(MAX_NEWTON):
         if live.size == 0:
@@ -121,42 +164,9 @@ def local(ctx, q, held, dt):
         idx = live
         qp = q0[:, idx] - e[:, idx] - av[:, idx]
         mu, Hm = potentials(qp, idx)
-        th, mup, Jp = pore(av[:, idx], idx)
-        Xe = mu - menv[:, None]
-        Xa = mu - mup
-        pa = Son[:, idx] & (Xa > 0)
-        Re = np.where(Eon[:, idx], e[:, idx] - ke[:, idx] * Xe, e[:, idx])
-        Ra = np.where(Son[:, idx], av[:, idx] - ks[:, idx] * np.where(pa, Xa, 0.0), av[:, idx])
-        m_ = idx.size
-        kE = np.where(Eon[:, idx], ke[:, idx], 0.0).T[:, :, None]         # [m, S, 1]
-        kA = np.where(pa, ks[:, idx], 0.0).T[:, :, None]
-        if K == 1 and ne == 1:                                            # one exchanging substance: scalar
-            i0 = ie[0]
-            Jd = kE[:, i0, 0] * (Hm[i0, i0] + gJ[i0, i0] + sig[idx]) + 1.0
-            d = (-Re[i0] / Jd)[:, None]
-        else:
-            iea = np.concatenate([ie, ia])
-            Jm = jac(Hm, idx, iea, iea)                                   # [m, K, K]: rows (ie, ia), cols (ie, ia)
-            kk = np.concatenate([kE[:, ie, 0], kA[:, ia, 0]], 1)[:, :, None]
-            J = kk * Jm
-            if ia.size:
-                J[:, ne:, ne:] += kA[:, ia] * Jp[:, None, None]
-            J += IK[None]
-            Rv = np.concatenate([Re[ie], Ra[ia]], 0).T                    # [m, K]
-            d = np.linalg.solve(J, -Rv[:, :, None])[:, :, 0]
-        de = np.zeros((S, m_)); da = np.zeros((S, m_))
-        de[ie] = d[:, :ne].T
-        da[ia] = d[:, ne:].T
-        dqp = -(de + da)
-        t = np.ones(m_)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            lim = np.where((dqp < 0) & (qp > 0) & ~single[idx][None, :], 0.9 * qp / -dqp, np.inf).min(0)
-            dth = da.sum(0) / C if C > 0 else np.zeros(m_)
-            lim2 = np.where(dth > 0, 0.9 * (1 - th) / dth, np.inf)
-        t = np.minimum(t, np.minimum(lim, lim2))
-        e[:, idx] += t * de
-        av[:, idx] += t * da
-        done = (t == 1.0) & np.all(np.abs(d) <= 1e-13 * h0[idx][:, None] + 1e-300, axis=1)
+        # the Newton update, per cell, compiled (goo/world/kernels.py): the residual, the Jacobian, the limited step
+        done = local_newton_update(idx, np.ascontiguousarray(mu), np.ascontiguousarray(Hm), e, av, Eon, Son, ke, ks,
+                                   menv, P, Pb, w0, float(C), sig, gJ, ie, ia, single, q0, h0, elo, ehi)
         live = idx[~done]
     else:
         raise Reject("local: Newton did not converge")
@@ -212,10 +222,10 @@ def local(ctx, q, held, dt):
         av[isub, sidx] = np.where(drain[sidx], 0.0, as_)
         # the update is q' = q0 - e - a, exactly in flux form
     q1 = q0 - e - av
-    drain = drain & single
+    drain = (drain & single) | mdrain
     if drain.any():
         for j in np.flatnonzero(drain):
-            i = int(np.flatnonzero(q0[:, j] > 0)[0])
+            i = int(np.flatnonzero(q0[:, j] > 0)[0]) if single[j] else int(dsub[j])
             T = q0[i, j]
             ek, sk = Eon[i, j], Son[i, j]
             if ek and not sk:
@@ -240,12 +250,18 @@ def local(ctx, q, held, dt):
                     aa = lo
                 ee = T - aa
             xi = ee / ke[i, j] + menv[i] if ee > 0 else aa / ks[i, j] + (-P[i, j] + Pb[j] * ((w0[j] + aa) / C) / (1 - (w0[j] + aa) / C))
-            mu00, _ = potentials(np.zeros((S, 1)), np.array([j]), need_hess=False)
+            qz = np.zeros((S, 1))
+            if not single[j]:
+                qz[:, 0] = q0[:, j]; qz[i, 0] = DRAIN_EPS * T
+            mu00, _ = potentials(qz, np.array([j]), need_hess=False)
             if xi > mu00[i, 0] + 1e-9 * abs(mu00[i, 0]) + 1e-300:
                 raise Reject("local: drained cell violates its KKT condition")
             e[:, j] = 0.0; av[:, j] = 0.0
             e[i, j], av[i, j] = ee, aa
-            q1[:, j] = 0.0
+            if single[j]:
+                q1[:, j] = 0.0
+            else:
+                q1[:, j] = q0[:, j]; q1[i, j] = 0.0          # the others do not move: exactly what they held
         q1[:, ~drain] = (q0 - e - av)[:, ~drain]
     # e < 0 is condensation (the film's potential is below the reservoir's: a gum-rich film takes water from the
     # air); exchange is two-way (Psi* = r k (mu - mu°)^2 / 2), so only amounts and sorption (one-way) must be >= 0
@@ -258,7 +274,7 @@ def local(ctx, q, held, dt):
     capf = np.flatnonzero(np.isin(G.fL, cells) | np.isin(G.fR, cells))
     dF = dF_grav(ctx, cells, q0, dq) + dF_cap(ctx, capf, h, dh) + dF_wet(ctx, cells, h0, dh[cells]) + dF_exch(ctx, dq)
     if not nonmix:
-        mx1 = mixing(ctx, q1)
+        mx1 = mixing_potentials(ctx, q1)
         dF += dx ** 2 * np.sum((mx1[0] + mx1[3]) - (mx0[0] + mx0[3]))
     dF += -dx ** 2 * np.sum(ctx.mu_env[:, None] * av)          # the pores' matter is counted against its reservoir
     if ctx.P is not None and C > 0 and av.any():

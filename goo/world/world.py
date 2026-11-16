@@ -6,7 +6,7 @@ from goo.film import Film, Ground, Stack
 from goo.ledger import Ledger, Receipt, Flag
 from goo.world.protocol import Environment, call, unwrap
 from goo.world.grid import Grid, panel_faces
-from goo.world.common import Ctx, Reject, mixing, pore_B
+from goo.world.common import Ctx, Reject, mixing, mixing_potentials, pore_B
 from goo.units import k_B
 from goo.world.flow import flow
 from goo.world.diffuse import diffuse
@@ -254,7 +254,7 @@ class World:
             wetc = np.flatnonzero(h.ravel() > 0)
             mixf = 0.0
             if wetc.size:
-                mx = mixing(self._ctx_stub(), q.reshape(len(self.substances), -1)[:, wetc])
+                mx = mixing_potentials(self._ctx_stub(), q.reshape(len(self.substances), -1)[:, wetc])
                 if mx is not None:
                     mixf = dx2 * np.sum(mx[0] + mx[3])
             out["mixing"] = mixf
@@ -293,16 +293,28 @@ class World:
         if self._solver_now not in ("exact", "iterative"):
             raise ValueError("solver: 'exact' or 'iterative'")
         self._stats = {}
+        # rest memo (DYNAMICS.md §9a): a step that every substep left on an exit decided on the old state alone is a
+        # step of every size; until the state, the environment, the clock's rate or the solver changes, the next step
+        # is the same rest step and is not recomputed. The key's version counts every change of q, held, z_b and the
+        # environment (every act goes through a method that counts it); the arrays' identities guard a replacement.
+        rkey = None if rate is None else (hashlib.sha1(np.ascontiguousarray(r).tobytes()).hexdigest()
+                                          if np.ndim(rate) else float(rate))
+        key = (self._version, id(self.q), id(self.ground.held), window, self._solver_now, rkey)
+        memo = getattr(self, "_rest", None)
+        if memo is not None and memo[0] == key:
+            return self._rest_step(dt, r, rate, memo)
         mm, me = self.matter.mark(), self.energy.mark()
         t0 = self.t
         flags = []
         sb = float(self.energy.balance("stored"))
         Fb0 = self.F()
         R = _union(self._window(window), self._dirty)
+        rest = True
         acc = {k: 0.0 for k in MECHANISMS}
         acc.update(num_time=0.0, num_transport=0.0, moved=0.0, pieces=0.0, num_local=0.0, drained=0.0, num_constraint=0.0)
         e = np.zeros(len(self.substances)); a = np.zeros(len(self.substances))
         rnd = 0.0
+        chg = 0.0
         relabel = 0.0
         dF = 0.0
         sl = 0.0
@@ -325,6 +337,7 @@ class World:
                 del self._saved
                 self._version += 1
                 raise
+            rest = len(reps) == 1 and bool(reps[0]["rest"])
             for rep in reps:
                 for k in MECHANISMS:
                     acc[k] += rep[k]
@@ -336,6 +349,17 @@ class World:
                 e += rep["e"]; a += rep["a"]
             R, q0, h0 = self._saved
             del self._saved
+            # the largest change of any amount in a cell, relative to the cell's thickness (before or after, the
+            # larger, and at least a tenth of the thickest cell of the region, so that a front entering bare cells
+            # is measured against the film and not against the nothing it enters): advance's bound on change per
+            # step and the scale of its error estimate (§9a). Cells outside the wet region are 0 either way, so the
+            # number is the same in a window and on the panel.
+            q1 = self.q[_sl(R)]
+            hb, ha = q0.sum(0), q1.sum(0)
+            href = np.maximum(np.maximum(hb, ha), 0.1 * max(float(hb.max(initial=0.0)), float(ha.max(initial=0.0))))
+            with np.errstate(divide="ignore", invalid="ignore"):
+                rc = np.where(href > 0, np.max(np.abs(q1 - q0), axis=0) / href, 0.0)
+            chg = float(np.max(rc)) if rc.size else 0.0
             op = getattr(self, "_Fopen", None)
             before = dict(op[1]) if op is not None and op[0] == R else self._F_box(R, q=q0, held=h0)
             after = self._F_box(R)
@@ -373,6 +397,9 @@ class World:
             report["solver tolerance"] = RTOL
             report["solver fallbacks"] = float(self._stats.get("solver fallbacks", 0))
 
+        # how diffusion was solved (DYNAMICS.md §4.2a): by the ray, or by the Newton where the ray fell short
+        for k in ("diffusion rays", "diffusion fallbacks", "max diffusion ray shortfall"):
+            report[k] = float(self._stats.get(k, 0.0))
         nwet = 0 if R is None else int(np.count_nonzero(self.q[_sl(R)].sum(0) > 0))     # the same in a window
         # the time part's sign is the construction's (§5); the transport part's is not established for a mixing f
         # with a concave interaction part (a stated gap, §5 "Flow and mixing"), so only the time part is judged here
@@ -384,14 +411,41 @@ class World:
         report.update({"max energy floor": float(nwet * k_B * self.env.T), "D_num time": float(acc["num_time"]), "D_num transport": float(acc["num_transport"]),
                        "D_num local": float(acc["num_local"]), "D_num constraint": float(acc["num_constraint"]), "drained cells": float(acc["drained"]),
                        "energy moved": float(acc["moved"]), "max slope": sl, "pieces": acc["pieces"],
+                       "max relative change": chg,
                        "rate integral": float(dt * np.sum(r) * self.dx ** 2)})
-        return Receipt("step", t0, self.t, self.matter.since(mm) + self.energy.since(me), res,
-                       {k: (Fb[k], Fa[k]) for k in TERMS}, tuple(flags), report)
+        out = Receipt("step", t0, self.t, self.matter.since(mm) + self.energy.since(me), res,
+                      {k: (Fb[k], Fa[k]) for k in TERMS}, tuple(flags), report)
+        self._rest = None
+        if rest and not out.entries and relabel == 0.0:
+            # a rest step: remember what it reported, except what depends on dt (the rate's integral, the privilege)
+            key = (self._version, id(self.q), id(self.ground.held), window, self._solver_now, rkey)   # after the step
+            self._rest = (key, tuple(f for f in flags if not (f.kind == "privilege" and f.subject == "painter")),
+                          dict(report), {k: (Fb[k], Fa[k]) for k in TERMS}, res, R)
+        return out
+
+    def _rest_step(self, dt, r, rate, memo):
+        """The step at a memoised rest state: what step() would compute, without computing it (O4: the state is
+        returned bit for bit, nothing is posted). Tested against the computed step receipt by receipt."""
+        _, flags, report, F, res, R = memo
+        t0 = self.t
+        self.t = t0 + dt
+        flags = list(flags)
+        if rate is not None and not np.all(r == 1.0):
+            flags.insert(0, Flag("privilege", "painter", f"clock rate in [{r.min():g}, {r.max():g}]; amount: integral of r over cells and time, m^2 s",
+                                 float(dt * np.sum(r) * self.dx ** 2)))
+        report = dict(report)
+        report["rate integral"] = float(dt * np.sum(r) * self.dx ** 2)
+        self._dirty = R
+        return Receipt("step", t0, self.t, (), dict(res), dict(F), tuple(flags), report)
 
     ADVANCE_TOL = 1e-3          # D_num (time part) per step, as a share of the energy the step moved
     ADVANCE_DT0 = 1e-3          # s: the first step when the world has no step-size history
 
     ADVANCE_MIN = 1e-9          # a rejected step shrinks fourfold; below this share of the duration advance stops
+    ADVANCE_CHANGE = 0.1        # a step that changes no amount by more than this share of its cell's thickness is
+                                # held to its error in proportion: e is scaled by (change / ADVANCE_CHANGE)
+    ADVANCE_CHANGE_MAX = 0.25   # the bound on change per step: above it the next step halves, and dt only doubles
+                                # when the doubled step's change would stay below it
 
     def advance(self, duration, rate=None, solver=None, dt=None, tol=None):
         """Cover `duration` seconds of world time with as many steps as needed; return the summed Receipt.
@@ -450,6 +504,13 @@ class World:
             if r.report.get("drained cells", 0.0) > 0:
                 dn -= r.report.get("D_num local", 0.0)
             e = dn / moved if moved > 0 else 0.0
+            # The noise floor (DYNAMICS.md §9a): e is a relative error of the energy the step moved, which does not
+            # vanish as a decaying mode dies out (implicit Euler's D_num / energy moved is about lambda dt / 2 at
+            # every amplitude), and near equilibrium both are rounding. What the painter sees is the state, so a step
+            # that changes no amount by more than ADVANCE_CHANGE of its cell is held to its error only in proportion
+            # to how much it changed: an absolute tolerance on the state, ADVANCE_CHANGE * tol.
+            chg = r.report.get("max relative change", 0.0)
+            e *= min(1.0, chg / self.ADVANCE_CHANGE)
             pieces = r.report.get("pieces", 1.0) or 1.0
             full = take >= h * (1 - 1e-9)
             # A shrink that does not lower e by a quarter shows an error that is not the time step's (a constraint's
@@ -466,7 +527,9 @@ class World:
                     h = take
                 else:
                     h = take / 2
-            elif e <= tol / 4 and full:
+            elif chg > self.ADVANCE_CHANGE_MAX and full:
+                h = take / 2                            # the bound on change per step
+            elif e <= tol / 4 and full and 2 * chg <= self.ADVANCE_CHANGE_MAX:
                 hold = None
                 h = 2 * h
             if full:
@@ -550,6 +613,7 @@ class World:
         rep = {k: 0.0 for k in MECHANISMS}
         S = len(self.substances)
         rep.update(num_time=0.0, num_transport=0.0, moved=0.0, e=np.zeros(S), a=np.zeros(S), num_local=0.0, drained=0.0, num_constraint=0.0)
+        rep["rest"] = True
         if not np.any(self.q):
             return rep
         win = self._window(window)
@@ -590,7 +654,8 @@ class World:
         self.ground.held[:, y0:y1, x0:x1] = held3.reshape(S, Hh, Ww)
         ctxflags.extend(flags)
         for k, v in pst.items():                    # only an accepted piece's solves count
-            self._stats[k] = max(self._stats.get(k, 0.0), v) if k == "solver residual" else self._stats.get(k, 0) + v
+            self._stats[k] = (max(self._stats.get(k, 0.0), v) if (k == "solver residual" or k.startswith("max "))
+                              else self._stats.get(k, 0) + v)
         rep["viscous"], rep["plastic"] = fr["D_viscous"], fr["D_plastic"]
         rep["diffusion"] = dr["D_diffusion"]
         rep["exchange"], rep["sorption"] = lr["D_exchange"], lr["D_sorption"]
@@ -603,6 +668,7 @@ class World:
         rep["moved"] = (abs(fr["dE"]) + abs(fr["dF_mix"]) + fr["D_viscous"] + fr["D_plastic"] + abs(dr["dF"])
                         + dr["D_diffusion"] + abs(lr["dF"]) + lr["D_exchange"] + lr["D_sorption"])
         rep["e"], rep["a"] = lr["e"], lr["a"]
+        rep["rest"] = bool(fr.get("rest") and dr.get("rest") and lr.get("rest"))
         return rep
 
     # ---- residuals, flags --------------------------------------------------------------------------------

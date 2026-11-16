@@ -237,3 +237,79 @@ def test_settle_retires_only_what_cannot_flow():
     assert len(w.strata) == 1 and np.all(w.q[1] == 0) and np.array_equal(w.q[0], q[0])
     assert r.residual["matter"] <= 1e-12 and r.residual["energy"] <= 1e-12
     assert w.settle().entries == ()                   # nothing left that cannot flow
+
+
+# ---- the rest memo (DYNAMICS.md §9a) ---------------------------------------------------------------------------
+def _resting(H=12, W=14):
+    """A uniform paste of the library's substances with no reservoir: exactly at rest (O4)."""
+    from goo.film import Ground
+    from goo.substance import maps, library as L
+    subs = (L.WATER, L.GUM_ARABIC, L.RUTILE)
+    g = Ground(np.zeros((H, W)), L.CELLULOSE, 0.0, 5 * um, 400 * um)
+    h = np.full((H, W), 30 * um)
+    return World(maps, subs, g, 0.25 * mm, Environment(), q=np.stack([h * 0.6, h * 0.05, h * 0.35]))
+
+
+def _count_memo(monkeypatch):
+    n = [0]
+    orig = World._rest_step
+
+    def counted(self, *a):
+        n[0] += 1
+        return orig(self, *a)
+    monkeypatch.setattr(World, "_rest_step", counted)
+    return n
+
+
+def test_rest_memo_is_used_and_gives_the_computed_receipts(monkeypatch):
+    n = _count_memo(monkeypatch)
+    a, b = _resting(), _resting()
+    for dt, rate in ((1.0, None), (2.0, None), (0.5, None), (3.0, 0.5), (3.0, 0.5), (1.0, np.full((12, 14), 0.25)),
+                     (1.0, np.full((12, 14), 0.25))):
+        ra = a.step(dt, rate=rate)
+        b._rest = None                                  # b computes every step
+        rb = b.step(dt, rate=rate)
+        assert ra.digest() == rb.digest() and a.digest() == b.digest()
+    assert n[0] >= 3                                    # the memo was used, and gave the computed receipts
+
+
+@pytest.mark.parametrize("act", ["add", "retire", "settle", "environment", "rate", "solver", "window", "fork"])
+def test_rest_memo_is_invalidated_by_every_act(act, monkeypatch):
+    """After each act the next step is computed, not recalled, and equals the step of a world that never memoises."""
+    from goo.substance import library as L
+    n = _count_memo(monkeypatch)
+    a = _resting()
+    a.step(1.0)
+    assert a._rest is not None
+    b = a.fork()
+    b._rest = None
+    kw = {}
+
+    def act_on(w):
+        if act == "add":
+            w.add({"water": np.where(np.arange(14)[None, :] < 3, 1 * um, 0.0) * np.ones((12, 1))})
+        elif act == "retire":
+            m = np.zeros((12, 14), bool); m[:4, :4] = True
+            w.retire(mask=m)
+        elif act == "settle":
+            # settle retires cells that cannot flow; give two cells nothing but rutile (viscosity +inf: jammed)
+            w.add({"rutile": np.where(np.arange(14)[None, :] < 1, 0.0, 0.0) * np.ones((12, 1))})
+            w.retire(mask=None, substances=["water", "gum_arabic"])
+            assert w.settle().report["cells retired"] > 0
+        elif act == "environment":
+            w.set_environment(Environment(activity={"water": 0.5}))
+    if act == "fork":
+        a = a.fork()
+    elif act in ("add", "retire", "settle", "environment"):
+        act_on(a); act_on(b)
+    elif act == "rate":
+        kw = dict(rate=0.5)
+    elif act == "solver":
+        kw = dict(solver="iterative")
+    elif act == "window":
+        kw = dict(window="panel")
+    before = n[0]
+    ra = a.step(1.0, **kw)
+    assert n[0] == before, "the memo was used after an act that changes what a step does"
+    rb = b.step(1.0, **kw)
+    assert ra.digest() == rb.digest()

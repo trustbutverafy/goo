@@ -32,6 +32,7 @@ import numpy as np
 from goo.units import T_room, R_gas, k_B, g_0
 from goo.evidence import derive, Bounded, Derived, weakest
 from goo.substance import response
+from goo.substance import _freeenergy as _fe
 from goo.substance.dielectric import h_planck
 from goo.substance.morphology import SPHERICAL, envelope_rho
 
@@ -107,6 +108,7 @@ class ReactionRate(NamedTuple):
     substance: str
     reaction: object          # the goo.substance.Reaction
     rate: Derived             # [H, W] 1/s: d(extent)/dt = rate * (mass of the substance)
+    affinity: Derived         # [H, W] J per kg of extent: -dG - sum_i nu_i mu_i / rho_i - sum_res nu_res mu_res
 
 
 # ------------------------------------------------------------------------------------------------------- helpers
@@ -229,11 +231,11 @@ class _F:
 
 
 def _miscible(si, sj, T):
-    """Regular-solution critical test for one pair: B < (k T / 2)(1/sqrt(v_i) + 1/sqrt(v_j))^2."""
-    ci, cj = si.cohesion, sj.cohesion
-    if ci is None or cj is None:
+    """Flory-Huggins critical test for one pair of liquids with the interaction of goo.substance._freeenergy
+    (Hansen where both give their parts, else Hildebrand): B < (k T / 2)(1/sqrt(v_i) + 1/sqrt(v_j))^2."""
+    B, rule = _fe.pair_interaction(si, sj)
+    if rule is None:
         return np.ones(np.shape(T), bool)
-    B = (np.sqrt(max(ci, 0.0)) - np.sqrt(max(cj, 0.0))) ** 2
     vi, vj = si.molecular_volume, sj.molecular_volume
     return B < 0.5 * k_B * T * (1 / np.sqrt(vi) + 1 / np.sqrt(vj)) ** 2
 
@@ -634,8 +636,24 @@ def _eta_liquids(F, why):
         else:
             neg |= here
     why.add("a liquid with eta <= 0 (impossible): mixed linearly", neg)
+    # vitrification: a binder whose solvent (every other liquid) is at or below its glass composition s_g is a glass;
+    # above it the log-mixed viscosity carries the free-volume factor exp(y_b s_g / (s - s_g)) (Doolittle's form
+    # with the free volume taken proportional to the solvent in excess of the glass composition: negligible in the
+    # wet range, divergent at s_g)
+    glass = np.zeros(F.shape, bool)
+    for a, i in enumerate(li):
+        sb = F.subs[i]
+        if sb.rheo.glass is None:
+            continue
+        here = F.q[i] > 0
+        sv = 1.0 - y[a]
+        gl = here & (sv <= sb.rheo.glass)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ln = ln + np.where(here & ~gl, y[a] * sb.rheo.glass / np.where(gl, 1.0, sv - sb.rheo.glass), 0.0)
+        glass |= gl
+    why.add("the liquid is a glass (a binder's solvent at or below its glass composition): it does not flow", glass)
     _liquid_phase(F, why)
-    return np.where(F.L > 0, np.where(neg, lin, np.exp(ln)), np.inf)
+    return np.where(F.L > 0, np.where(glass, np.inf, np.where(neg, lin, np.exp(ln))), np.inf)
 
 
 def viscosity(film):
@@ -644,8 +662,14 @@ def viscosity(film):
     linearly), each eta_l(T) = eta_l exp(E_eta / R (1/T - 1/T_ref)). Particles: Krieger & Dougherty (1959)
     eta = eta_l (1 - phi/phi_m)^(-[eta] phi_m), phi = P / (P + L) the particles' fraction of the suspension, phi_m from
     `packing`, [eta] = 5/2 (Einstein, rigid spheres). Dilute limit: eta_l (1 + 5/2 phi).
-    Domain, each a named reason: phi < phi_m (beyond: inf, jammed); a liquid present (a powder: inf); every liquid
-    with a viscosity; miscible liquids; E_eta given where T != T_ref; the packing's. Empty cells: inf, in domain."""
+    Vitrification: a binder b with a glass composition s_g (rheo.glass) whose solvent fraction s_b = 1 - y_b (every
+    other liquid) is at or below s_g makes the liquid a glass: +inf (it no longer flows; goo.world's settle() retires
+    it). Above, eta_l carries exp(y_b s_g / (s_b - s_g)) (Doolittle's free-volume form, the free volume taken
+    proportional to the solvent in excess of the glass composition, coefficient 1: assumed): negligible when wet,
+    divergent at s_g, monotone in s_b.
+    Domain, each a named reason: phi < phi_m (beyond: inf, jammed); not a glass (else inf); a liquid present (a
+    powder: inf); every liquid with a viscosity; miscible liquids; E_eta given where T != T_ref; the packing's.
+    Empty cells: inf, in domain."""
     F = _F.of(film)
     phim, why = _packing(F)
     eta_l = _eta_liquids(F, why)
@@ -794,40 +818,35 @@ def settling(film):
     return derive(v, ev, in_domain=why.domain, map=why.text("settling"))
 
 
-def _interaction(F):
-    """B [S, S]: (sqrt(c_i) - sqrt(c_j))^2, zero where either lacks a cohesive energy density."""
-    c = [s.cohesion for s in F.subs]
-    S = len(c)
-    Bm = np.zeros((S, S))
-    for i in range(S):
-        for j in range(S):
-            if c[i] is not None and c[j] is not None:
-                Bm[i, j] = (np.sqrt(max(c[i], 0.0)) - np.sqrt(max(c[j], 0.0))) ** 2
-    return Bm
+def _mix_evidence(F):
+    def keys(s):
+        k = s.molecular_volume_keys()
+        if s.morph is None and s.cohesion is not None:
+            k = k + (s.cohesion_parts_keys() if s.cohesion_parts is not None else s.cohesion_keys())
+        if s.morph is not None:
+            k = k + ("morph",)
+        return k
+    ev = F.ev(keys)
+    if any(F.present[i] for i in F.idx(True)) and any(F.present[i] for i in F.idx(False)):
+        ev = weakest(ev, F.ev(lambda s: ("thermo.gamma",), only=F.idx(False)))
+    return weakest("assumed", ev)
 
 
 def chemical_potential(film):
-    """mu [S, H, W] J/m^3 of each substance: mu_s = d(h f)/d q_s for the free energy density of mixing
-    f = k T sum_s (phi_s / v_s) ln phi_s + (1/2) sum_ij B_ij phi_i phi_j (Flory-Huggins with the Hildebrand-Scatchard
-    interaction B_ij = (sqrt(c_i) - sqrt(c_j))^2), v_s the mixing volume (molecular, or the mean particle volume),
-    phi = q / h. Closed form: mu_s = k T / v_s (ln phi_s + 1) - k T sum_j phi_j / v_j + sum_j B_sj phi_j - f_int.
-    The pure substance has mu = 0. A substance absent from a cell has mu = -inf there (any amount entering lowers F
-    without bound); a macromolecular phase (v = inf) has no entropy term of its own and stays finite. Empty cells:
-    -inf for every molecular or particle substance. Always in domain: this is the model F, not an approximation to
-    it. Evidence: at best assumed (the regular solution is a model)."""
+    """mu [S, H, W] J/m^3 of each substance: d(F_mix)/dq_s of the mixing free energy of `mixing` (both parts):
+    the liquids' solution among the liquids alone (Flory-Huggins with the Hansen or Hildebrand interaction), the
+    particles' ideal entropy and their excluded volume (goo.substance._freeenergy). A liquid's mu includes minus
+    the particles' osmotic pressure; a particle holds no solvent. The pure substance has mu = 0. A substance absent
+    from a cell has mu = -inf there when it has a mixing unit (any amount entering lowers F without bound); a
+    macromolecular phase (v = inf) has no entropy of its own and stays finite. Empty cells: -inf for every molecular
+    or particle substance, 0 for the others. Always in domain: this is the model F. Evidence: at best assumed."""
     F = _F.of(film)
-    v = np.array([s.molecular_volume for s in F.subs])
-    Bm = _interaction(F)
-    kT = k_B * F.T
-    phi = F.phi
-    inv = np.where(np.isfinite(v), 1.0 / v, 0.0)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ent = np.where(inv[:, None, None] > 0, inv[:, None, None] * (np.log(phi) + 1), 0.0)
-    Bphi = np.tensordot(Bm, phi, 1)
-    mu = kT[None] * (ent - np.tensordot(inv, phi, 1)[None]) + Bphi - 0.5 * np.sum(phi * Bphi, 0)[None]
-    ev = weakest("assumed", F.ev(lambda s: s.molecular_volume_keys() + s.cohesion_keys()
-                                 if s.cohesion is not None else s.molecular_volume_keys()))
-    return derive(mu, ev, map="chemical_potential")
+    S = len(F.subs)
+    ms = _fe.MixSet.of(F.subs)
+    f, mu, _, fx, mux = _fe.evaluate(ms, F.q.reshape(S, -1), F.T.reshape(-1), need_hess=False)
+    with np.errstate(invalid="ignore"):
+        tot = mu + mux
+    return derive(tot.reshape(F.q.shape), _mix_evidence(F), map="chemical_potential")
 
 
 def surface_tension(film):
@@ -902,30 +921,70 @@ def evaporation(film, env):
 
 
 def reactions(film, env):
-    """[ReactionRate(substance, reaction, rate)] for every reaction of every substance present: rate [H, W] 1/s =
-    k exp(-E_a / R (1/T - 1/T_ref)) times the activities of the environment reservoirs it consumes (every reactant
-    that is not a substance of the film is drawn from env.activity; 0 when not named). The extent advances at rate
-    x (mass of the reacting substance per area); the stoichiometry moves mass. Domain: every product is a substance
-    of the film (else its mass has nowhere to go)."""
+    """[ReactionRate(substance, reaction, rate, affinity)] for every reaction of every substance present.
+
+    rate [H, W] 1/s = k exp(-E_a / R (1/T - 1/T_ref)) times the activities of the environment reservoirs it consumes
+    (every reactant that is not a substance of the film is drawn from env.activity; 0 when not named). The extent
+    advances at rate x (mass of the reacting substance per area); the stoichiometry moves mass.
+
+    affinity [H, W] J per kg of extent, the force conjugate to the extent (positive: the reaction runs downhill):
+        A = -dG - sum_i nu_i mu_i / rho_i - sum_res nu_res (R T / M_res) ln a_res
+    nu the stoichiometry (kg per kg of extent), dG the description's free energy of reaction (film substances pure,
+    reservoirs at activity 1, T_ref), mu_i the film's mixing potential (J/m^3, `mixing`, both parts) of each film
+    substance, a_res the environment's activity of each reservoir, M_res its molar mass (Reaction.M_reservoir).
+    A first-order rate r with this affinity is the dissipation potential Psi* = r m A_+ per area (convex in A, zero at
+    A <= 0, m the reacting mass per area): the world writes cure as a term of F (sum_i rho_i q_i g_i) and this Psi*.
+    Conventions: a film substance absent from the cell has mu = -inf (its first molecule makes A = +inf); its term
+    is left out, so A is then a finite lower bound (any A > 0 gives the same Psi* rate). A reservoir at activity 0:
+    its term is left out likewise (the rate is 0 there). No dG: A = 0, out of domain. dG is at T_ref: away from it,
+    out of domain. Domain: every product is a substance of the film (else its mass has nowhere to go); dG and the
+    reservoirs' molar masses given; T = T_ref for the affinity."""
     F = _F.of(film)
-    names = {s.name for s in F.subs}
+    names = {s.name: i for i, s in enumerate(F.subs)}
     envs = dict(env.activity)
     out = []
+    mx = None
     for i, s in enumerate(F.subs):
         if not F.present[i]:
             continue
         for rx in s.reactions:
             k = rx.rate * np.exp(-rx.E_a / R_gas * (1 / F.T - 1 / T_room))
             why = F.why()
+            wa = F.why()
+            here = F.q[i] > 0
+            A = np.zeros(F.shape)
+            Mres = dict(rx.M_reservoir)
+            if rx.dG is None:
+                wa.add(f"{s.name}'s reaction has no free energy of reaction (dG)", here)
+            else:
+                if mx is None:
+                    mx = mixing_potentials(film).value
+                A = A - rx.dG
+                wa.add("dG is at T_ref; the cell is not", here & (np.abs(F.T - T_room) > 1e-9))
             for n, c in rx.stoich:
                 if n in names:
+                    j = names[n]
+                    if rx.dG is not None:
+                        with np.errstate(invalid="ignore"):
+                            mu = mx.mu[j] + mx.mu_x[j]
+                        A = A - np.where(np.isfinite(mu), c * mu / F.subs[j].rho, 0.0)
                     continue
                 if c < 0:
-                    k = k * envs.get(n, 0.0)
+                    a_res = float(envs.get(n, 0.0))
+                    k = k * a_res
+                    if rx.dG is not None:
+                        if n not in Mres:
+                            wa.add(f"no molar mass for the reservoir {n}: its potential is left out", here)
+                        elif a_res > 0:
+                            A = A - c * R_gas * F.T / Mres[n] * np.log(a_res)
                 else:
-                    why.add(f"its product {n} is not a substance of the film", F.q[i] > 0)
-            out.append(ReactionRate(s.name, rx, derive(k, weakest("assumed", s.evidence("reactions")),
-                                                       in_domain=why.domain, map=why.text(f"reactions[{s.name}]"))))
+                    why.add(f"its product {n} is not a substance of the film", here)
+            wa.merge(why)
+            ev = weakest("assumed", s.evidence("reactions"))
+            eva = weakest(ev, s.evidence("reactions.dG"), _mix_evidence(F)) if rx.dG is not None else "assumed"
+            out.append(ReactionRate(s.name, rx, derive(k, ev, in_domain=why.domain, map=why.text(f"reactions[{s.name}]")),
+                                    derive(np.where(F.empty, 0.0, A), eva, in_domain=wa.domain,
+                                           map=wa.text(f"reactions.affinity[{s.name}]"))))
     return out
 
 
@@ -934,63 +993,60 @@ def mixing(film, T=None):
     """MixingTerms(f, mu, hess, f_x, mu_x) of goo.world's protocol: the mixing free energy per area of each cell,
     homogeneous of degree 1 in q, with its derivatives with respect to q, split into a convex and a concave part.
 
-    F_mix = h f_v(phi): Flory-Huggins with the Hildebrand-Scatchard interaction (as `chemical_potential`),
-        f_ent = k T sum_i (q_i / v_i) ln(q_i / h)       convex in q (the perspective of a sum of convex x ln x)
-        f_int = (1/2) q^T B q / h                        B_ij = (sqrt c_i - sqrt c_j)^2, indefinite
-    Split: with beta = max(0, largest eigenvalue of B) (one number per set of substances, so the split is the same in
-    every cell and every window),
-        convex  f   = f_ent + (beta / 2) (q^T q / h - h)    (q^T M q / h is convex for M >= 0; h is linear in q)
-        concave f_x = (1/2) q^T (B - beta I) q / h + (beta / 2) h       (B - beta I <= 0)
-    and f + f_x = f_ent + f_int exactly; a pure substance has f = f_x = 0. Derivatives, for Q = (1/2) q^T M q / h: dQ/dq = M q / h - (q^T M q) / (2 h^2);
-    d2Q = M / h - (M q 1^T + 1 (M q)^T) / h^2 + (q^T M q) 1 1^T / h^3. The entropy's: mu_i = k T (c_i (ln phi_i + 1)
-    - sum_j c_j phi_j), hess_ij = k T (c_i delta_ij / q_i - (c_i + c_j) / h + sum_k c_k phi_k / h), c = 1 / v.
+    F_mix (goo.substance._freeenergy, whose docstring gives every formula):
+      liquids   Flory-Huggins among the liquids alone, k T sum_l c_l q_l ln(q_l / L), with the interaction
+                (1/2) q_l^T B q_l / L: B the Hansen distance where both liquids give their polar and hydrogen-bonding
+                parts (so water and ethanol mix), else Hildebrand-Scatchard
+      particles their ideal entropy k T sum_p c_p q_p ln(q_p / h) (c_p = 1 / particle volume: negligible per volume)
+                and their excluded volume, a hard-sphere excess per population against the liquid it sits in whose
+                osmotic pressure diverges at the population's packing fraction (from its own size distribution),
+                followed until it reaches the capillary entry pressure of the pores; beyond, voids open and the
+                term is linear (the liquid's potential is minus that pressure). Particles hold no solvent.
+    Split: convex f = the entropies + excluded volume + (beta / 2)(q_l^T q_l / L - L); concave f_x = (1/2) q_l^T
+    (B - beta I) q_l / L + (beta / 2) L, beta = max(0, largest eigenvalue of B over the film's liquids) (one number
+    per set of substances, so the split is the same in every cell and every window). f + f_x is the free energy;
+    a pure substance (a dry powder too) has f = f_x = 0.
     T: the temperature (K), a number or [H, W]; None: the film's state, else T_ref.
-    At an absent substance mu is -inf (any amount entering lowers F without bound) and its hess entries are 0; on an
-    empty cell f = f_x = 0, mu_x = 0 and hess = 0 (the world masks both). A macromolecular phase (no M) has no
-    entropy of its own. Evidence: at best assumed (the regular solution is a model)."""
+    At an absent substance with a mixing unit mu is -inf, its hess entries are 0; on an empty cell f = f_x = 0,
+    mu_x = 0, hess = 0. Cost: what the cells' compositions cost: each distinct (volume fractions, T) is solved once,
+    on the substances present in it. Evidence: at best assumed. See also `mixing_potentials`, `mixing_hvp`."""
     F = _F.of(film, T)
     S = len(F.subs)
-    q, h = F.q, F.h
-    wet = h > 0
-    hs = np.where(wet, h, 1.0)
-    v = np.array([s.molecular_volume for s in F.subs])
-    c = np.where(np.isfinite(v), 1.0 / v, 0.0)[:, None, None]
-    kT = k_B * F.T
-    pres = q > 0
-    with np.errstate(divide="ignore", invalid="ignore"):
-        lnphi = np.where(pres, np.log(np.where(pres, q, 1.0) / hs), -np.inf)
-        f_ent = kT * np.sum(np.where(pres, c * q * lnphi, 0.0), 0)
-        cphi = np.sum(c * (q / hs), 0)                          # c phi, so a pure substance's mu is exactly 0
-        mu_ent = kT * (np.where(c > 0, c * (lnphi + 1.0), 0.0) - cphi)
-        eye = np.eye(S)[:, :, None, None]
-        diag = np.where(pres, c / np.where(pres, q, 1.0), 0.0)
-        H_ent = kT * (eye * diag[:, None] - (c[:, None] + c[None, :]) / hs + cphi / hs)
-    Bm = _interaction(F)
-    beta = max(0.0, float(np.linalg.eigvalsh(Bm).max())) if S else 0.0
+    ms = _fe.MixSet.of(F.subs)
+    f, mu, H, fx, mux = _fe.evaluate(ms, F.q.reshape(S, -1), F.T.reshape(-1), need_hess=True)
+    shp = F.shape
+    out = MixingTerms(f.reshape(shp), mu.reshape((S,) + shp), H.reshape((S, S) + shp), fx.reshape(shp),
+                      mux.reshape((S,) + shp))
+    return derive(out, _mix_evidence(F), map=_mix_text(ms))
 
-    def quad(M):
-        Mq = np.tensordot(M, q, 1)
-        qMq = np.sum(q * Mq, 0)
-        f = 0.5 * qMq / hs
-        mu = Mq / hs - 0.5 * qMq / hs ** 2
-        Hq = (M[:, :, None, None] / hs - (Mq[:, None] + Mq[None, :]) / hs ** 2 + qMq / hs ** 3)
-        return f, mu, Hq
-    fc, muc, Hc = quad(beta * np.eye(S))
-    fx, mux, _ = quad(Bm - beta * np.eye(S))
-    # move the linear term (beta / 2) h from the convex part to the concave one, so a pure substance has 0 in each
-    fc, muc = fc - 0.5 * beta * h, muc - 0.5 * beta
-    fx, mux = fx + 0.5 * beta * h, mux + 0.5 * beta
-    pp = pres[:, None] & pres[None, :]
-    f = np.where(wet, f_ent + fc, 0.0)
-    mu = np.where(pres, mu_ent + muc, np.where(c > 0, -np.inf, muc))
-    mu = np.where(wet[None], mu, np.where(c > 0, -np.inf, 0.0))
-    hess = np.where(pp & wet, H_ent + Hc, 0.0)
-    f_x = np.where(wet, fx, 0.0)
-    mu_x = np.where(wet[None], mux, 0.0)
-    ev = weakest("assumed", F.ev(lambda s: s.molecular_volume_keys() + s.cohesion_keys()
-                                 if s.cohesion is not None else s.molecular_volume_keys()))
-    return derive(MixingTerms(f, mu, hess, f_x, mu_x), ev,
-                  map=f"mixing (Flory-Huggins + Hildebrand-Scatchard; convex split beta = {beta:.3g} J/m^3)")
+
+def _mix_text(ms):
+    return (f"mixing (liquids: Flory-Huggins + Hansen/Hildebrand; particles: ideal + hard-sphere excess to the "
+            f"capillary entry pressure; convex split beta = {ms.beta:.3g} J/m^3)")
+
+
+def mixing_potentials(film, T=None):
+    """`mixing` without its Hessian: MixingTerms(f, mu, None, f_x, mu_x), the same arrays bit for bit, at a
+    fraction of the cost (no [S, S, H, W] array). For callers that need potentials only."""
+    F = _F.of(film, T)
+    S = len(F.subs)
+    ms = _fe.MixSet.of(F.subs)
+    f, mu, _, fx, mux = _fe.evaluate(ms, F.q.reshape(S, -1), F.T.reshape(-1), need_hess=False)
+    shp = F.shape
+    out = MixingTerms(f.reshape(shp), mu.reshape((S,) + shp), None, fx.reshape(shp), mux.reshape((S,) + shp))
+    return derive(out, _mix_evidence(F), map=_mix_text(ms))
+
+
+def mixing_hvp(film, dq, T=None):
+    """The convex part's Hessian applied to dq [S, H, W] (m), per cell: [S, H, W] J/m^3, equal to
+    einsum('ijc,jc->ic', mixing(film).hess, dq) without materialising the Hessian (each cell's block is formed on
+    its present substances only and discarded). Entries of absent substances are 0, as in `mixing`."""
+    F = _F.of(film, T)
+    S = len(F.subs)
+    ms = _fe.MixSet.of(F.subs)
+    q = F.q.reshape(S, -1); dqf = np.asarray(dq, float).reshape(S, -1)
+    out = _fe.hvp(ms, q, F.T.reshape(-1), dqf)
+    return derive(out.reshape(F.q.shape), _mix_evidence(F), map="mixing_hvp")
 
 
 def mobility(film):
@@ -1023,8 +1079,9 @@ def exchange(film, env):
     F = _F.of(film)
     S = len(F.subs)
     Tenv = _env_T(env)
-    mx = mixing(film).value
-    mu = mx.mu + mx.mu_x
+    mx = mixing_potentials(film).value
+    with np.errstate(invalid="ignore"):
+        mu = mx.mu + mx.mu_x
     kT = k_B * F.T
     v = np.array([s.molecular_volume for s in F.subs])
     acts = dict(env.activity)

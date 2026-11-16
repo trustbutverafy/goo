@@ -2,7 +2,7 @@
 import numpy as np
 import scipy.sparse as sp
 from goo.world.linsolve import Inner
-from goo.world.common import Reject, coeff, mixing, dF_grav, dF_cap, dF_wet, dF_exch
+from goo.world.common import Reject, coeff, mixing, mixing_potentials, mixing_hvp, dF_grav, dF_cap, dF_wet, dF_exch
 
 MAX_NEWTON = 60
 LOG_STEP = 8.0       # largest fall of ln q in one iteration (a damping; e^-30 is reached in four)
@@ -24,16 +24,18 @@ def diffuse(ctx, q, dt):
     G = ctx.grid
     dx, N = G.dx, G.N
     S = q.shape[0]
-    rep = dict(D_diffusion=0.0, dF=0.0, cells=np.zeros(0, np.int64))
+    rep = dict(D_diffusion=0.0, dF=0.0, cells=np.zeros(0, np.int64), rest=False)
     h = q.sum(0)
     wet = h > 0
     fL, fR = G.fL, G.fR
     rf = np.minimum(ctx.r[fL], ctx.r[fR])
     fa = np.flatnonzero(wet[fL] & wet[fR] & (rf > 0))
     if fa.size == 0:
+        rep["rest"] = True
         return q, rep
     Lam = coeff(ctx, "mobility", q, None)
     if Lam is None or not np.any(Lam[:, wet] > 0):
+        rep["rest"] = True
         return q, rep
     with np.errstate(divide="ignore", invalid="ignore"):
         phi = np.where(wet, q / h, 0.0)
@@ -50,6 +52,7 @@ def diffuse(ctx, q, dt):
     W = om.sum(0)
     k = W > 0
     if not k.any():
+        rep["rest"] = True
         return q, rep
     fa, om, W, a, b, om_kappa = fa[k], om[:, k], W[k], a[k], b[k], om_kappa[:, k]
     cells = np.unique(np.concatenate([a, b]))
@@ -60,7 +63,7 @@ def diffuse(ctx, q, dt):
     hc = h[cells]
     gx, gy, gn = ctx.g
     psi = gn * (ctx.zb[cells] + 0.5 * hc) - (gx * G.X[cells] + gy * G.Y[cells])
-    mx0 = mixing(ctx, q0)
+    mx0 = mixing_potentials(ctx, q0)
     if mx0 is None:
         raise ValueError("Constitutive: mobility without mixing has no force")
     mux0 = mx0[4]
@@ -92,6 +95,7 @@ def diffuse(ctx, q, dt):
     om, W, iL, iR = om[:, keep], W[keep], iL[keep], iR[keep]
     om_kappa = om_kappa[:, keep]
     if not keep.any():
+        rep["rest"] = True
         return q, rep
     # kappa_i,f: the face's mobility per unit volume fraction of the donor; omega_i = kappa_i phi'_i(donor).
     # Only substances that move on some face are unknowns: the others carry no flux (omega = 0 removes their rows and
@@ -156,6 +160,33 @@ def diffuse(ctx, q, dt):
         H = mx[2][sa][:, sa]
         return H, X, j, dv, omg, W, Xb, up, upn, gr
 
+    # the ray (DYNAMICS.md §4.2a): one explicit Onsager flux at the old state and the exact search along its ray, where
+    # no substance enters a cell that lacks it; the Newton below is the fallback when the ray's step falls short
+    if not new.any():
+        ray = _ray(ctx, q0, sa, kap, iL, iR, hc, mux0a, grava, mx0, dt, dx)
+        if ray is not None:
+            t, q1a, D = ray
+            st = ctx.stats
+            if st is not None:
+                st["diffusion rays"] = st.get("diffusion rays", 0) + 1
+                st["max diffusion ray shortfall"] = max(st.get("max diffusion ray shortfall", 0.0), 1.0 - t)
+            q1 = q0.copy()
+            q1[sa] = q1a                            # the ray's last evaluated state, bit for bit (its mixing is memoised)
+            dqf = q1 - q0
+            if np.any(q1 < 0):
+                raise Reject("diffusion: negative amount")
+            qn = q.copy(); qn[:, cells] = q1
+            dh = np.zeros(N); dh[cells] = dqf.sum(0)
+            capf = np.flatnonzero((pos[fL] >= 0) | (pos[fR] >= 0))
+            mx1 = mixing_potentials(ctx, q1)
+            dF = (dx ** 2 * np.sum((mx1[0] + mx1[3]) - (mx0[0] + mx0[3])) + dF_grav(ctx, cells, q0, dqf)
+                  + dF_cap(ctx, capf, h, dh) + dF_wet(ctx, cells, hc, dh[cells]) + dF_exch(ctx, dqf))
+            rep.update(D_diffusion=D, dF=dF, cells=cells)
+            # no flux at all (every relative force exactly 0 at the old state): a rest of every dt (rest memo)
+            rep["rest"] = D == 0.0 and not np.any(dqf)
+            return qn, rep
+        if ctx.stats is not None:
+            ctx.stats["diffusion fallbacks"] = ctx.stats.get("diffusion fallbacks", 0) + 1
     c = dt / dx ** 2
     up = None
     lu, lu_up, prev = None, None, np.inf
@@ -169,7 +200,9 @@ def diffuse(ctx, q, dt):
         R = qp - q0a + (dt / dx) * dv
         r = R[pi, pj]
         if it == 0 and not np.any(r) and np.array_equal(upn, up):
-            break                                      # exactly at rest: nothing to solve
+            # exactly at rest: nothing to solve; with every divergence exactly 0 this holds for every dt (rest memo)
+            rep["rest"] = not np.any(dv)
+            break
         rn = float(np.max(np.abs(r)))
         # chord Newton: keep the last Jacobian (and its preconditioner) while the residual falls at least tenfold per
         # iteration and the upwind directions are those it was built with; otherwise rebuild
@@ -259,6 +292,108 @@ def diffuse(ctx, q, dt):
         Dm = np.where(W > 0, 0.5 * np.sum(omg[:, None, :] * omg[None, :, :] * dX * dX, axis=(0, 1)) / W, 0.0)
     rep.update(D_diffusion=dt * dx ** 2 * np.sum(Dm), dF=dF, cells=cells)
     return qn, rep
+
+
+RAY_MIN = 0.9        # the ray's step as a share of the explicit flux below which the Newton solve is used instead
+RAY_ITERS = 40       # safeguarded Newton-bisection iterations on the ray's derivative (each one mixing evaluation)
+
+
+def _ray(ctx, q0, sa, kap, iL, iR, hc, mux0a, grava, mx0, dt, dx):
+    """The diffusion substep as one explicit Onsager flux and an exact search along its ray (DYNAMICS.md §4.2a).
+
+    At the old state: X_i = -(mu_i,R - mu_i,L)/dx with the full potential (mixing, both parts, and rho_i psi),
+    omega_i = kappa_i phi_i(donor) with donors that agree with the relative force (as the Newton's directions do),
+    j = omega (X - Xbar), delta = -(dt/dx) div j. Along q(t) = q0 + t delta, Phi(t) = F_c(q(t)) + t <mu_x(q0) +
+    rho psi, delta> dx^2 + t^2 D1 / 2, with D1 = dt dx^2 sum omega (X - Xbar)^2, is convex. The step returned is the
+    largest t in [0, T] (T = min(1, what keeps every amount positive)) at which Phi'(t) <= 0 was computed: there
+    D_num >= -t Phi'(t) >= 0 by convexity, with D_mech = t^2 D1 (the flux t j is driven by the force t (X - Xbar)
+    through the same L). Returns (t, q1 [Sa, n], D_mech), or None when t < RAY_MIN or the potentials are not finite
+    (the caller then solves by Newton)."""
+    from goo.world.common import mixing_potentials, mixing_hvp
+    S, n = q0.shape
+    q0a = q0[sa]
+    on = kap > 0
+    mu = mx0[1][sa] + mux0a + grava
+    muL, muR = mu[:, iL], mu[:, iR]
+    if not (np.all(np.isfinite(muL[on])) and np.all(np.isfinite(muR[on]))):
+        return None
+    X = np.where(on, -(muR - muL) / dx, 0.0)
+    phiL, phiR = q0a[:, iL] / hc[iL], q0a[:, iR] / hc[iR]
+    w = kap * 0.5 * (phiL + phiR)
+    Wg = w.sum(0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        up = (X - np.where(Wg > 0, (w * X).sum(0) / Wg, 0.0)) >= 0
+    fscale = np.max(np.where(on, np.abs(muL) + np.abs(muR), 0.0), axis=0, keepdims=True) / dx
+    for _ in range(4):
+        omg = kap * np.where(up, phiL, phiR)
+        W = omg.sum(0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            Xb = np.where(W > 0, (omg * X).sum(0) / W, 0.0)
+        clear = np.abs(X - Xb) > 1e-12 * fscale
+        upn = np.where((omg > 0) & clear, (X - Xb) >= 0, up)
+        if np.array_equal(upn, up):
+            break
+        up = upn
+    Sa = sa.size
+    # a relative force below the rounding of the potentials it is a difference of (1e-12 of their size, the Newton's
+    # rule for directions) carries no flux: on a face where one substance moves alone, X - Xbar is such rounding (L is
+    # exactly 0 there). D_num >= 0 needs only Phi'(t) <= 0 and D_mech = t^2 D1 with the D1 of Phi, so this is admissible.
+    Xr = np.where(clear, X - Xb, 0.0)
+    j = omg * Xr
+    dv = np.empty((Sa, n)); out = np.empty((Sa, n))
+    for i in range(Sa):
+        dv[i] = np.bincount(iL, j[i], n) - np.bincount(iR, j[i], n)
+        out[i] = np.bincount(iL, np.maximum(j[i], 0.0), n) + np.bincount(iR, np.maximum(-j[i], 0.0), n)
+    delta = -(dt / dx) * dv
+    out *= dt / dx
+    D1 = dt * dx ** 2 * float(np.sum(omg * Xr * Xr))
+    if not D1 > 0:
+        return (1.0, q0a.copy(), 0.0) if D1 == 0.0 and not np.any(delta) else None
+    with np.errstate(divide="ignore", invalid="ignore"):
+        tf = float(np.min(np.where(out > 0, q0a / out, np.inf)))
+    T = min(1.0, tf * (1.0 - 1e-9))
+    if not T >= RAY_MIN:
+        return None
+    dx2 = dx ** 2
+    glin = dx2 * float(np.sum((mux0a + grava) * delta))
+    qfull = q0.copy()
+
+    def deriv(t, second):
+        qt = q0a + t * delta
+        qfull[sa] = qt
+        mx = mixing_potentials(ctx, qfull)
+        d1 = dx2 * float(np.sum(np.where(qt > 0, mx[1][sa], 0.0) * delta)) + glin + t * D1
+        if not second:
+            return d1, None
+        dfull = np.zeros_like(qfull); dfull[sa] = delta
+        d2 = dx2 * float(np.sum(mixing_hvp(ctx, qfull, dfull)[sa] * delta)) + D1      # delta^T H delta, no Hessian
+        return d1, d2
+    lo, hi = 0.0, T                                    # Phi'(lo) <= 0 (at 0 it is -D1); Phi'(hi) > 0 unless hi = T is taken
+    d1, d2 = deriv(T, True)
+    if not np.isfinite(d1):
+        return None
+    if d1 <= 0.0:
+        t = T
+    else:
+        t = T
+        for _ in range(RAY_ITERS):
+            tn = t - d1 / d2 if (d2 is not None and d2 > 0) else 0.5 * (lo + hi)
+            if not (lo < tn < hi):
+                tn = 0.5 * (lo + hi)
+            d1, d2 = deriv(tn, True)
+            if not np.isfinite(d1):
+                return None
+            if d1 <= 0.0:
+                lo = tn
+            else:
+                hi = tn
+            t = tn
+            if hi - lo <= 1e-12 * hi or d1 == 0.0:
+                break
+        t = lo                                         # the largest t at which Phi' <= 0 was computed
+    if t < RAY_MIN:
+        return None
+    return t, q0a + t * delta, t * t * D1
 
 
 def nu_of(pj):

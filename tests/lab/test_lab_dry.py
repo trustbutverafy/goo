@@ -91,13 +91,13 @@ def test_an_underbound_dry_film_holds_voids_the_maps_see_as_air():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         o = maps.optical(d, R.LAB_BANDS)
-    assert type(o.host).__name__ == "Bounded"                    # liquid and air in an unknown microstructure
+    # every drop of water leaves (next test), so the dry film is powder in air: an exact host of index 1, with no
+    # liquid left to make its microstructure unknown
+    host = getattr(o.host, "value", None)
+    assert host is not None and np.allclose(host, 1.0)
 
 
-@pytest.mark.xfail(strict=True, reason="Flory-Huggins mixing (maps.chemical_potential) treats a particle as a chain of "
-                   "lattice sites, so at 50 % RH a film of particles in water keeps ~23 % water by volume instead of "
-                   "drying to a powder with an adsorbed layer; owed to the substance owner (docs/LAB.md §2)")
 def test_particles_in_water_dry_to_a_powder_in_ordinary_air():
     d = dry(R.wet_film(R.Paint.of(lib.RUTILE), R.WATER), ROOM).film
     water = d.q[[s.name for s in d.substances].index("water")].item()
-    assert water < 0.01 * d.h.item()
+    assert water <= 1e-20 * d.h.item()                          # particles hold no water: only a binder does

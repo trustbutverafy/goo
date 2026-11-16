@@ -54,9 +54,10 @@ def mass(w, i):
 
 def test_pigmented_gum_water_dries_on_paper_to_equilibrium():
     """Water, gum arabic and hematite on paper at 50 % humidity. Water leaves to the air and into the paper until the
-    film's water is at the air's potential; gum arabic is hygroscopic in the maps (its film keeps about a fifth water
-    at 50 % RH, viscosity ~ 200 Pa s, finite at every water content), so settle() retires nothing: that is what the
-    descriptions say, not a failure (docs/DYNAMICS.md §9a)."""
+    film's water is at the air's potential. Gum arabic keeps what its isotherm says (a water fraction of about 0.16 at
+    50 % RH) and vitrifies below a solvent fraction of 0.194 (docs/SUBSTANCES.md §3a: viscosity +inf), so the dried
+    film is a glass and settle() retires it by law. (Before the substance maps' particle and binder rework the gum
+    kept a fifth water at a finite viscosity and nothing settled.)"""
     H = W = 96
     subs = (L.WATER, L.GUM_ARABIC, L.HEMATITE)
     q = layer(disc(H, W, W / 3), 15 * um, (0.80, 0.15, 0.05))
@@ -68,15 +69,16 @@ def test_pigmented_gum_water_dries_on_paper_to_equilibrium():
     assert np.all(w.q >= 0)
     # (none soaks in: the gum solution's water potential, ~ -3e6 Pa from the mixing map, is far below the paper's
     # suction, -1.5e4 Pa, so sorption's one-way force is not positive; the maps say so, not the world)
+    wet = w.q.sum(0) > 0
+    glass = wet & np.isposinf(np.asarray(maps.viscosity(w.film).value))
     r = w.settle()
-    assert r.report["cells retired"] == 0.0 and r.report["cells still wet"] > 0
+    # after 240 s the rim has vitrified and the centre is still drying (measured: 748 of 3624 cells): settle retires
+    # exactly the glassy cells, by law, and nothing else
+    assert r.report["cells retired"] == float(glass.sum()) > 0, r.report
+    assert r.report["cells still wet"] == float((wet & ~glass).sum())
+    assert r.residual["matter"] <= 1e-12 and r.residual["energy"] <= 1e-9
 
 
-@pytest.mark.xfail(strict=True, reason="O3: where one pigment enters the other paint, the diffusion step uses the entering "
-                   "substance's explicit (concave) potential masked to 0 instead of its finite value, and D_num's time "
-                   "part is negative (-8e-7 J against dF = -2e-13 J), which now raises the solver flag. Keeping mu_x "
-                   "finite (goo/world/common.py, tried) fixes the sign but stalls the diffusion Newton on the journal "
-                   "replay scene; left to the diffusion rewrite (PROGRESS.md, Checkpoint 4)")
 def test_two_pigmented_paints_meet_wet():
     """Hematite and ultramarine gum-water paints laid side by side, touching, on a sealed ground (160 x 120)."""
     H, W = 120, 160
@@ -262,3 +264,61 @@ def test_a_drop_running_down_a_steep_tilt_books_finite_dissipation():
         released += -dF
     x1 = (w.q.sum(0) * (np.arange(W) + 0.5)).sum() / w.q.sum()
     assert x1 > x0 + 1.0
+
+
+# ---- advance: the noise floor and the bound on change per step (DYNAMICS.md §9a) ------------------------------
+def _paste(H=48, W=64):
+    """A full-panel paste with a yield stress, losing water to the air (bench/scenes.py quiet, quiet.py's scene)."""
+    subs = (L.WATER, L.GUM_ARABIC, L.RUTILE)
+    g = Ground(np.zeros((H, W)), L.CELLULOSE, 0.0, 5 * um, 400 * um)
+    h = 30 * um * (1.0 + 0.3 * np.random.default_rng(0).random((H, W)))
+    q = np.stack([h * 0.60, h * 0.05, h * 0.35])
+    return World(maps, subs, g, 0.25 * mm, Environment(activity={"water": 0.5}), q=q)
+
+
+def test_advance_dries_a_paste_to_equilibrium_in_few_steps_and_matches_small_steps():
+    """3600 s of drying: before the noise floor, advance held dt at 0.5 s for 2000 s at equilibrium (5516 steps on
+    96 x 128, docs/PERFORMANCE.md §1.2); now dt grows as the film stops changing. Measured (substance maps of
+    2026-11-15, with gum's glass transition): 158 steps. The controller's tolerance is an absolute one on the state
+    (ADVANCE_CHANGE * tol = 1e-4 of a cell's thickness per step), so the comparison with fixed 10 s steps (themselves
+    first order) is absolute too: the mean water every 300 s agrees to 8.7e-4 of the initial water (5 % of the little
+    left at 600 s, where the film passes its glass transition), the final state to 2.9e-4 of the thickest cell. The
+    dried film is a glass and settle() retires all of it."""
+    a, b = _paste(), _paste()
+    steps, wa, wb = 0, [], []
+    for _ in range(12):
+        r = a.advance(300.0)
+        assert not r.flagged("solver"), [f.detail for f in r.flagged("solver")]
+        assert r.residual["matter"] <= 1e-12 and r.residual["energy"] <= 1e-9, r.residual
+        steps += int(r.report["steps"])
+        wa.append(float(a.q[0].mean()))
+    while b.t < 3600.0 - 1e-9:
+        b.step(10.0)
+        if abs(b.t / 300.0 - round(b.t / 300.0)) < 1e-9:
+            wb.append(float(b.q[0].mean()))
+    assert steps <= 200, steps
+    w0 = float(_paste().q[0].mean())
+    assert max(abs(x - y) for x, y in zip(wa, wb)) <= 3e-3 * w0
+    assert float(np.max(np.abs(a.q - b.q))) <= 1e-3 * float(b.q.sum(0).max())
+    assert a._dt_next >= 256.0                                    # at equilibrium the step has grown
+    r = a.settle()
+    assert r.report["cells still wet"] == 0.0 and r.report["cells retired"] == float(a.H * a.W)
+
+
+@pytest.mark.parametrize("kind", ["sealed", "paper"])
+def test_a_particle_film_drains_its_last_water_exactly(kind):
+    """Rutile with a trace of water (1 nm to 0.5 um) at 50 % RH: a particle holds no water (its potential is bounded below
+    by the menisci's -Pi_e, far above the air's), so the thinnest cells give all their water in one step. The drain rule
+    of a cell of several substances (DYNAMICS.md §4.3): water exactly 0 there, rutile untouched bit for bit, ledgers
+    closed, D_num >= 0. (Before it, the Newton crept toward 0 by its limiter and the step failed after 24 halvings.)"""
+    H = W = 8
+    subs = (L.WATER, L.RUTILE)
+    q = np.zeros((2, H, W)); q[1] = 3 * um; q[0] = np.linspace(1e-9, 0.5 * um, H * W).reshape(H, W)
+    w = World(maps, subs, ground(kind, H, W, subs), 0.25 * mm, Environment(activity={"water": 0.5}), q=q)
+    r = w.step(2.0)
+    assert not r.flagged("solver"), [f.detail for f in r.flagged("solver")]
+    assert r.report["drained cells"] > 0
+    assert np.sum(w.q[0] == 0.0) >= r.report["drained cells"] and np.all(w.q >= 0)
+    assert np.array_equal(w.q[1], q[1])
+    assert r.residual["matter"] <= 1e-12 and r.residual["energy"] <= 1e-9, r.residual
+    assert r.report["D_num time"] >= 0.0

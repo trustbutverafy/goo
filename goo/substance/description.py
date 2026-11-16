@@ -20,6 +20,11 @@ Thermo: its terms in the free energy F (all at the reference temperature T_ref =
                        that does not evaporate. Typing it for a substance that has dH_vap and M is refused: it is
                        derivable. Interaction energy density between i and j: (sqrt(c_i) - sqrt(c_j))^2 phi_i phi_j
                        (Hildebrand-Scatchard regular solution). None: no interaction terms.
+  cohesion_p J/m^3     the polar part of the cohesive energy density (Hansen's delta_p^2), and
+  cohesion_h J/m^3     its hydrogen-bonding part (delta_h^2); the dispersive part is the rest, cohesion - p - h
+                       (DERIVED). Given for both of a pair of liquids, their interaction energy density is the
+                       Hansen distance (sqrt d_i - sqrt d_j)^2 + (1/4)(sqrt p_i - sqrt p_j)^2 + (1/4)(sqrt h_i -
+                       sqrt h_j)^2 instead of Hildebrand's (hydrogen bonds that both make cost nothing to mix).
   gamma      J/m^2     surface tension of a liquid against air; for a solid, its surface free energy against air
   gamma_d    J/m^2     the dispersive (London) part of gamma (Fowkes; Owens-Wendt): the rest, gamma - gamma_d, is
                        the polar part. Interfacial tension between a and b: gamma_a + gamma_b - 2 sqrt(gd_a gd_b)
@@ -34,13 +39,20 @@ Rheo: its terms in the dissipation potential Psi*
   separation m         closest approach of two particles of this population (an adsorbed or steric layer): with the
                        Hamaker constant derived from eps, it sets the attraction that gives a yield stress
   phi_percolation 1    the particle volume fraction at which an attractive network first spans (YODEL's phi_0)
+  glass      1         a binder's glass composition: the volume fraction of the other liquids around it (its
+                       solvent) at or below which its solution is a glass at T_ref: the liquids' viscosity diverges
+                       there (+inf: it no longer flows; goo.world's settle() retires it)
   coupling   as declared   symmetric Onsager matrix among the rates of the declared state variables (tuple of
                        tuples); its symmetric part must be positive semi-definite (dissipative) and it must equal its
                        transpose (reciprocal)
 
-Reactions: Reaction(stoich=((name, kg per kg of extent), ...), rate (1/s at T_ref), E_a (J/mol)). Reactants carry
-negative coefficients, products positive; names are substances or environment reservoirs ("oxygen"). The
-substance itself must be a reactant. Mass is conserved iff the coefficients sum to zero.
+Reactions: Reaction(stoich=((name, kg per kg of extent), ...), rate (1/s at T_ref), E_a (J/mol), dG (J per kg of
+extent), M_reservoir=((reservoir name, kg/mol), ...)). Reactants carry negative coefficients, products positive;
+names are substances or environment reservoirs ("oxygen"). The substance itself must be a reactant. Mass is
+conserved iff the coefficients sum to zero. dG is the free energy of reaction per kg of extent at T_ref with every
+film substance pure and every reservoir at activity 1 (None: no claim; the affinity is then not derived);
+M_reservoir gives the molar mass of each reservoir it draws, for the reservoir's potential (R T / M) ln a per kg.
+Provenance: "reactions" for the stoichiometry and rate, "reactions.dG" for dG and M_reservoir.
 
 State: StateVar(name, unit, lo, hi): internal state variables the substance declares (the film's `state` holds them).
 
@@ -59,6 +71,8 @@ class Thermo:
     p_sat: float = None
     dH_vap: float = None
     cohesion: float = None
+    cohesion_p: float = None
+    cohesion_h: float = None
     gamma: float = None
     gamma_d: float = None
     D_vapour: float = None
@@ -74,6 +88,7 @@ class Rheo:
     E_eta: float = None
     separation: float = None
     phi_percolation: float = None
+    glass: float = None
     coupling: tuple = None
 
 
@@ -82,6 +97,8 @@ class Reaction:
     stoich: tuple                      # ((name, kg per kg of extent), ...)
     rate: float                        # 1/s at T_ref, first order in the reacting substance
     E_a: float = 0.0                   # J/mol
+    dG: float = None                   # J per kg of extent at T_ref, film substances pure, reservoirs at activity 1
+    M_reservoir: tuple = ()            # ((reservoir name, kg/mol), ...)
 
     def coefficient(self, name):
         return sum(v for n, v in self.stoich if n == name)
@@ -140,6 +157,8 @@ class Substance:
             out.append("morph")
         if self.reactions:
             out.append("reactions")
+        if any(r.dG is not None or r.M_reservoir for r in self.reactions):
+            out.append("reactions.dG")
         out += [f"thermo.{k}" for k in _params(self.thermo)]
         out += [f"rheo.{k}" for k in _params(self.rheo)]
         return out
@@ -184,6 +203,19 @@ class Substance:
         if t.dH_vap is not None and t.M is not None:
             return ("thermo.dH_vap", "thermo.M", "rho")
         return ("thermo.cohesion",)
+
+    @property
+    def cohesion_parts(self):
+        """(dispersive, polar, hydrogen-bonding) parts of the cohesive energy density, J/m^3, or None when the
+        polar and hydrogen-bonding parts are not both given. The dispersive part is derived: cohesion - p - h."""
+        t = self.thermo
+        c = self.cohesion
+        if c is None or t.cohesion_p is None or t.cohesion_h is None:
+            return None
+        return (c - t.cohesion_p - t.cohesion_h, t.cohesion_p, t.cohesion_h)
+
+    def cohesion_parts_keys(self):
+        return self.cohesion_keys() + ("thermo.cohesion_p", "thermo.cohesion_h")
 
     @property
     def volatile(self):

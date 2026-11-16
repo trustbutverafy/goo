@@ -10,7 +10,7 @@ from goo.substance import maps, library as L
 from goo.units import um, k_B, T_room
 
 WORLD_FUNCS = ("viscosity", "yield_stress", "surface_tension", "mixing", "mobility", "exchange", "wetting",
-               "sorption", "reactions")
+               "sorption", "reactions", "mixing_potentials")
 
 
 def scene(H=3, W=5, seed=0):
@@ -43,12 +43,12 @@ def call(name, film):
 
 def arrays(v):
     if isinstance(v, list):
-        return [a for r in v for a in arrays(r.rate)]
+        return [a for r in v for a in arrays(r.rate) + arrays(r.affinity)]
     if hasattr(v, "lo"):
         return [np.asarray(v.lo), np.asarray(v.hi)]
     val = v.value if isinstance(v, Derived) else v
     if isinstance(val, tuple):
-        return [np.asarray(x) for x in val]
+        return [np.asarray(x) for x in val if x is not None]
     return [np.asarray(val)]
 
 
@@ -72,7 +72,7 @@ def test_element_wise_and_finite(name):
         assert np.array_equal(fa[..., cells], b.reshape(b.shape[:-2] + (-1,)), equal_nan=True), name
         assert np.array_equal(a[..., 1:, 2:], c, equal_nan=True), name
         bad = ~np.isfinite(a)
-        if name == "mixing":
+        if name in ("mixing", "mixing_potentials"):
             bad &= ~np.isneginf(a)
         if name in ("viscosity", "yield_stress"):
             # +inf only where nothing can flow: no liquid (empty or powder) or particles jammed; the viscosity
@@ -106,8 +106,9 @@ def test_mixing_split_derivatives_and_convexity():
         for i in range(S):                                  # mu = df/dq by central differences, both parts
             d = 1e-6 * q0[i]
             e = np.zeros(S); e[i] = d
-            assert mu0[i] == pytest.approx((parts(q0 + e)[0] - parts(q0 - e)[0]) / (2 * d), rel=1e-5, abs=1e-3)
-            assert mux0[i] == pytest.approx((parts(q0 + e)[3] - parts(q0 - e)[3]) / (2 * d), rel=1e-5, abs=1e-3)
+            rnd = 100 * np.finfo(float).eps * (abs(F0) + abs(Fx0)) / d     # the central difference's rounding
+            assert mu0[i] == pytest.approx((parts(q0 + e)[0] - parts(q0 - e)[0]) / (2 * d), rel=1e-5, abs=max(1e-3, rnd))
+            assert mux0[i] == pytest.approx((parts(q0 + e)[3] - parts(q0 - e)[3]) / (2 * d), rel=1e-5, abs=max(1e-3, rnd))
             assert np.allclose(H0[:, i], (parts(q0 + e)[1] - parts(q0 - e)[1]) / (2 * d), rtol=1e-4,
                                atol=1e-6 * np.abs(H0).max())
         assert np.linalg.eigvalsh(0.5 * (H0 + H0.T)).min() >= -1e-9 * np.abs(H0).max()   # convex part: PSD

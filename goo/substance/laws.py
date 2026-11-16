@@ -10,11 +10,18 @@ shortfall and its unit, and `classify`.
                   Shortfall: the larger of the gain and the remainder's excess over KK_TOL; unit 1 (eps is
                   dimensionless; the remainder is relative to max |eps - 1|).
   stable          its terms keep F bounded below: rho > 0 (gravity), gamma >= 0 (capillarity), cohesion >= 0
-                  (a real solubility parameter; for a volatile liquid dH_vap >= R T_ref), 0 <= gamma_d <= gamma, M > 0 and particle size > 0
-                  (a positive mixing volume), p_sat >= 0. Shortfall in the unit of the worst term.
+                  (a real solubility parameter; for a volatile liquid dH_vap >= R T_ref), its polar and hydrogen-
+                  bonding parts >= 0 and no larger than it (a dispersive part >= 0), 0 <= gamma_d <= gamma, M > 0
+                  and particle size > 0 (a positive mixing volume), p_sat >= 0, a particle population's excluded-
+                  volume term convex (its osmotic pressure rises with loading: packing fraction phi_m > 2/15 for
+                  goo's hard-sphere form, whose x^2 psi' has derivative x (2 + 3 a x) > 0 up to phi_m iff
+                  7.5 phi_m > 1), a reaction's free energy finite. Shortfall in the unit of the worst term.
   dissipative     its terms in Psi* are convex, non-negative and zero at zero force: eta > 0, separation > 0,
-                  0 <= phi_percolation < 1, D_vapour >= 0, reaction rates >= 0, coupling's symmetric part positive
-                  semi-definite. Shortfall in the unit of the worst term.
+                  0 <= phi_percolation < 1, 0 <= glass < 1 (the viscosity diverges at a solvent fraction in the
+                  range, convex in the force at every composition), D_vapour >= 0, reaction rates >= 0, and a
+                  reaction that runs (rate > 0) runs downhill at its reference state (dG < 0: Psi* = r m A_+ with
+                  A = -dG there), coupling's symmetric part positive semi-definite. Shortfall in the unit of the
+                  worst term.
   reciprocal      linear cross-effects are symmetric (Onsager): coupling equals its transpose. An isotropic scalar
                   eps and the Hildebrand interaction (a function of a symmetric difference) are reciprocal by
                   construction. Shortfall max |L - L^T| / 2, in the coupling's unit.
@@ -38,6 +45,7 @@ import numpy as np
 from scipy.optimize import nnls
 from goo.units import R_gas, T_room
 from goo.substance.dielectric import Oscillators, Lorentz, Drude, Gauss, eV, HC
+from goo.substance._freeenergy import population_packing, SPHERICAL
 
 KK_TOL = 0.02
 OSC_RANGE = (200e-9, 3000e-9)        # where an oscillator description's passivity is measured when not proved
@@ -205,6 +213,13 @@ def stable(s):
     c = s.cohesion
     if c is not None:
         T.append(("cohesion", max(0.0, -c), "J/m^3", f"cohesive energy density {c:.3g} J/m^3 < 0"))
+    for nm, v in (("cohesion_p", t.cohesion_p), ("cohesion_h", t.cohesion_h)):
+        if v is not None:
+            T.append((nm, max(0.0, -v), "J/m^3", f"{nm} = {v:.3g} J/m^3 < 0"))
+    parts = s.cohesion_parts
+    if parts is not None:
+        T.append(("cohesion_d", max(0.0, -parts[0]), "J/m^3", f"the dispersive part of the cohesive energy "
+                                                              f"(cohesion - p - h) is {parts[0]:.3g} J/m^3 < 0"))
     if t.M is not None:
         T.append(_positive("M", t.M, "kg/mol", f"M = {t.M:.3g} kg/mol <= 0"))
     if t.p_sat is not None:
@@ -213,6 +228,16 @@ def stable(s):
         z = s.morph.size
         T.append(_positive("size", z.d, "m", f"particle diameter {z.d:.3g} m <= 0"))
         T.append(("sigma_g", max(0.0, 1.0 - z.sigma_g), "1", f"sigma_g {z.sigma_g} < 1"))
+        if z.d > 0 and z.sigma_g >= 1:
+            pm = population_packing(s) if s.morph.kind in SPHERICAL else 0.634
+            T.append(("excluded volume", max(0.0, 2 / 15 - pm), "1", f"packing fraction {pm:.3g} <= 2/15: the "
+                      "hard-sphere osmotic pressure would fall with loading (not convex)", not pm > 2 / 15))
+    for i, rx in enumerate(s.reactions):
+        if rx.dG is not None:
+            T.append((f"reaction[{i}].dG", 0.0 if np.isfinite(rx.dG) else np.inf, "J/kg",
+                      f"reaction {i}'s free energy {rx.dG} is not finite", not np.isfinite(rx.dG)))
+        for n, M in rx.M_reservoir:
+            T.append(_positive(f"reaction[{i}].M[{n}]", M, "kg/mol", f"reservoir {n}'s molar mass {M:.3g} <= 0"))
     return _verdict("stable", T, "F bounded below by its terms")
 
 
@@ -227,10 +252,17 @@ def dissipative(s):
         p = r.phi_percolation
         T.append(("phi_percolation", max(0.0, -p, p - 1.0), "1", f"phi_percolation {p} outside [0, 1)",
                   not 0.0 <= p < 1.0))
+    if r.glass is not None:
+        g = r.glass
+        T.append(("glass", max(0.0, -g, g - 1.0), "1", f"glass composition {g} outside [0, 1)", not 0.0 <= g < 1.0))
     if t.D_vapour is not None:
         T.append(("D_vapour", max(0.0, -t.D_vapour), "m^2/s", f"D_vapour {t.D_vapour:.3g} m^2/s < 0"))
     for i, rx in enumerate(s.reactions):
         T.append((f"reaction[{i}].rate", max(0.0, -rx.rate), "1/s", f"reaction {i} runs at rate {rx.rate:.3g} 1/s < 0"))
+        if rx.dG is not None and rx.rate > 0:
+            T.append((f"reaction[{i}].affinity", max(0.0, rx.dG), "J/kg", f"reaction {i} runs (rate {rx.rate:.3g} "
+                      f"1/s) against its free energy (dG = {rx.dG:.3g} J/kg >= 0): it would make free energy",
+                      not rx.dG < 0))
     if r.coupling is not None:
         L = np.asarray(r.coupling, float)
         ev = np.linalg.eigvalsh(0.5 * (L + L.T))

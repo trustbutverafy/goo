@@ -231,12 +231,12 @@ or 1e-12 of the gross amount the fluxes carry through it (the flux-form update i
 known better; a 1e-21 m cell next to a 5e-6 m one could otherwise never converge). A Jacobian that is not finite,
 and a factorisation that fails, reject the substep (it halves); they never escape as errors.
 
-*The explicit potential of an entering substance* (an open defect). The concave part of mixing is smooth at
-q_i = 0, but a substance absent from a cell at the substep's start and allowed to enter it has its μ_x masked to 0
-together with the convex part (whose μ is −∞ there). The step then uses a force that is not F's: D_num's time part is
-negative where one pigment enters another paint (−8e-7 J against ΔF = −2e-13 J), and the receipt is flagged
-`solver`. Keeping μ_x finite fixes the sign but stalls the Newton iteration on another scene; not fixed yet
-(tests/world/test_world_painting.py, xfail).
+*The explicit potential of an entering substance.* A substance absent from a cell at the substep's start and allowed to
+enter it has its μ_x masked to 0 together with the convex part (whose μ is −∞ there). With the substance maps' particle
+thermodynamics (docs/SUBSTANCES.md §3a) a particle has no concave potential, so for an entering pigment the mask is
+exact and D_num's time part is no longer negative where one paint's pigment enters the other's
+(tests/world/test_world_painting.py, two paints meeting, no longer xfail). For an entering *liquid* with a concave
+interaction part the mask is still not F's derivative: an open defect where two liquids that interact meet.
 
 *Entry* (**R6**): a substance enters a neighbouring cell that lacks it only if, at e⁻³⁰ of the donor's
 fraction, the relative force at the old state still drives it in. Where it would not, its equilibrium
@@ -244,13 +244,77 @@ share in that cell is below e⁻³⁰ of the donor's (uphill against strong drif
 counter-flux), it is not representable against the fluxes that balance it, and that face carries none
 of it this step. A numerical threshold on representability, not a physical constant.
 
+
+*Particles in the Onsager matrix* (an open defect, found with the substance maps' particle thermodynamics).
+L = diag(ω) − ωωᵀ/Σω gives each substance a friction against the ω-weighted mean motion. For a particle p in one
+liquid w the pair's conductance is ω_p ω_w/(ω_p + ω_w), the smaller of the two: water's molecular mobility
+(Λ_w = D_w v_w/k_B T ≈ 1e-17 m²/(Pa s)) and not the particle's Stokes mobility (d²/18η ≈ 5e-12 for 0.3 um rutile), so
+the world interdiffuses particles and water at about 1e-16 m²/s where Stokes-Einstein (times the maps' thermodynamic
+factor) gives about 1e-12. Water's self-diffusion is friction of water against water; a particle's motion through the
+liquid is resisted by Stokes drag. The construction that says so is a network of pair conductances,
+L = Σ_{i<k} c_ik (e_i − e_k)(e_i − e_k)ᵀ (symmetric, positive semi-definite and L·1 = 0 for any c ≥ 0, so §5 holds):
+liquid with liquid c_lk = ω_l ω_k / W_L (W_L = Σ_liquids ω, the present rule among liquids), particle with liquid
+c_pl = ω_p ω_l / W_L (the particle drifts through the liquid at its own mobility: j_p = ω_p (X_p − X̄_L)), particle with
+particle 0 (no direct exchange). Without particles it is the present L. Not yet built: it needs the world to know which
+substances are particles (a description field, morphology, read through the protocol) and a new Jacobian for the
+Newton; until then particles in water diffuse too slowly, which is admissible (any L ⪰ 0 is) but wrong in rate.
+
+**4.2a The ray** (how diffusion is solved first; the Newton above is its fallback). Diffusion at these resolutions is
+not stiff (D dt/dx² ≈ 1e-4 to 0.06 for gum and water at dt of seconds and dx = 0.25 mm), so one explicit Onsager flux
+does what the Newton does, and the energy inequality is kept by a search along that flux's ray instead of by
+implicitness. At the old state, on the faces and substances of the solve (after R6 and R7, which act on ω as before):
+X_i = −(μ_i,R − μ_i,L)/dx with the full potential (mixing, both parts, and ρ_i ψ); ω_i = κ_i φ_i(donor), with donors
+that agree with the relative force, iterated at most four times from the centred guess (the Newton's rule, rounding
+included); j = ω (X − X̄), with a relative force below the rounding of the potentials it is a difference of
+(1e-12 of their size, the Newton's own rule) carrying none (on a face where one substance moves alone, X − X̄ is such
+rounding: L is exactly 0 there); δ = −(dt/dx) div j. Along q(t) = qⁿ + t δ,
+
+```text
+Φ(t) = F_c(q(t)) + t dx² ⟨μ_x(qⁿ) + ρψ, δ⟩ + ½ t² D1,       D1 = dt dx² Σ_f Σ_i ω_i (X_i − X̄)²  ≥ 0
+```
+
+is convex (F_c convex, the rest linear and quadratic). Φ'(0) = −D1 (summation by parts). The step is the largest t in
+[0, T], T = min(1, what keeps every amount positive), at which Φ'(t) ≤ 0 was *computed*: T itself when Φ'(T) ≤ 0,
+else the lower end of a safeguarded Newton-bisection bracket on Φ' (each evaluation one mixing call). The flux applied
+is t j and the force that drives it through the same L is t (X − X̄), so D_mech = t² D1, a sum of non-negative terms.
+Then, with q' = q(t) and G = −F_x convex,
+
+```text
+−ΔF − D_mech ≥ −t ⟨∇F_c(q') + ∇F_x(qⁿ) + ρψ, δ⟩ dx² − t² D1 + Bregman_G(q', qⁿ)  = −t Φ'(t) + Bregman_G  ≥ 0,
+```
+
+(the argument uses only Φ'(t) ≤ 0 and D_mech = t² D1 with the D1 of Φ, whatever flux δ came from), the first
+inequality being F_c(qⁿ) ≥ F_c(q') + ⟨∇F_c(q'), qⁿ − q'⟩ (convexity) and concavity of F_x, the last because
+t ≥ 0 and Φ'(t) ≤ 0 as computed. So D_num ≥ 0 holds **by construction** for any t the search returns, however inexact,
+not to a tolerance: an inexact search does less than the exact one, never something inadmissible. When t is interior,
+Φ'(t) = 0 to rounding and D_num is the Bregman divergence of the step (O(dt²)): the time error, which `advance` reads.
+At t = T = 1 with Φ'(1) < 0 the explicit step is a little short of the ray's optimum; −Φ'(1) is O(λ dt) D1, of the
+order of the Bregman part, and is also time error. Positivity: what leaves a cell is proportional to what it holds
+(upwind ω), and t ≤ (1 − 1e-9) of the bound that keeps every amount positive. O1: flux form. O4: zero forces give
+D1 = 0 and δ = 0 exactly, and the state is returned bit for bit. O5: element-wise arithmetic plus sums over the
+compacted active set in canonical order, the same in a window and on the panel.
+
+The Newton is used instead (counted as `diffusion fallbacks` in the receipt) when a substance enters a cell that lacks
+it (its μ is −∞ there and an explicit flux has no meaning), when a potential is not finite, or when t < 0.9 (the
+explicit flux is too long for this dt: stiff gradients). The receipt reports `diffusion rays` and `max diffusion ray
+shortfall` (1 − t). Measured (docs/PERFORMANCE.md §2.4): against 32 implicit substeps the ray's error is 3.0 % of the
+substep's change against implicit Euler's 3.6 % at dt = 2 s, equal at dt = 30 s, worse at dt = 120 s (t* = 0.25, where
+the fallback takes over). The open defect above (an entering substance's explicit potential) lies in the Newton path,
+which the ray does not take where a substance enters, so the ray neither cures nor explains it.
+
 **4.3 Exchange and sorption** (local). Per cell, unknowns e_i, a_i; Newton per cell, each cell
 stopping on its own tolerance. The film's potential at the new state uses: convex mixing implicit,
 concave mixing explicit, gravity split as in 4.1, and capillarity *stabilised*: μ_cap = (1/dx²)[∂F_cap/∂h_c(hⁿ) + σ_c δh_c]
 with σ_c = Σ_{f∋c} γ_f, which is the convex splitting F_cap = (σ/2)|h|² − ((σ/2)|h|² − F_cap) and
 needs σ ≥ ½ λ(γ L_graph) (Gershgorin). A single-substance cell whose implicit solution would have h < 0
 is drained exactly: h' = 0, with e and a split so that both see one force ξ; this is the KKT point of
-the constraint h ≥ 0, and ξ ≤ μ(h → 0⁺) is checked.
+the constraint h ≥ 0, and ξ ≤ μ(h → 0⁺) is checked. The same holds for a cell of several substances in which one
+substance i alone exchanges or is sorbed: with the others fixed its residual q_i' − q_i + e_i(q_i') + a_i(q_i') is
+increasing in q_i', and when it is ≥ 0 at q_i' = 1e-12 q_i (the root lies within that of zero) the cell gives all of i,
+exactly, split between e and a as above, the others untouched bit for bit, ξ ≤ μ_i(1e-12 q_i) checked. This is a
+particle film's last water: a particle holds no water (its potential is bounded below by the menisci's −Π_e), so the
+Newton, limited to 0.9 of what is held per iteration, only crept toward zero and the step failed. Candidates are found
+with one map call: μ_i increases with q_i, so what the step could take at the old amount bounds it from above.
 
 ## 5. Ledger and the argument for O1 to O4
 
@@ -413,12 +477,41 @@ window and on the panel. What it reads: D_num time less its constraint share (ab
 in the local step, less the local step's part; against the energy moved, floored at k_B T per cell of the region
 and at half the recent power (the moved energy per second of the last steps, averaged) times dt, so a step in which
 little happens is not held to a relative error on the little it moved. Only a full step (not the remainder that
-lands on the end) sets the next size. A halving that does not lower e by a quarter shows an error that is not the
+lands on the end) sets the next size. *The noise floor and the bound on change.* e is a relative error of the energy
+the step moved, which does not vanish as a decaying mode dies out (implicit Euler's D_num over the energy moved is about
+λ dt / 2 at every amplitude), and near equilibrium both are rounding: before this rule a drying paste was held at
+dt = 0.5 s for 2000 s of equilibrium (5516 steps for an hour of drying). The step reports `max relative change`, the
+largest change of any amount in a cell over the step, relative to the cell's thickness (at least a tenth of the thickest
+cell of the region, so a front entering bare cells is measured against the film); e is multiplied by
+min(1, change / 0.1), an absolute tolerance on the state of 0.1 tol per step; a step whose change exceeds 0.25 halves
+the next, and dt doubles only when the doubled step's change would stay below 0.25. Measured: the paste dries in
+145 steps, and its water agrees with fixed 10 s steps to 1.2e-3 every 300 s (tests/world/test_world_painting.py). A halving that does not lower e by a quarter shows an error that is not the
 time step's: the size returns to the one before and is held until e falls below tol/4. A step the world cannot
 take (`StepFailed`, after its 24 halvings) leaves the world exactly as it was (the step is all or nothing: what its
 accepted pieces committed is undone) and is retried at a quarter of its size; below 1e-9 of the duration advance
 stops and returns what it did, with a `solver` flag saying where and why. The clock's privilege is summed over
 the steps into one flag (equal flags of equal steps would otherwise merge when receipts add).
+
+*The rest memo.* A step every substep of which left on an exit decided on the old state alone (flow: no face can move;
+diffusion: no face with mobility, or every divergence exactly 0 at the old state; local: no driving reservoir and no
+pores) returns the state bit for bit for *every* dt, so until the state, the environment, the clock's rate, the solver
+or the window mode changes the next step is that same rest step. The world keeps the last such step's receipt keyed by
+its state version (counted by every act: step, add, retire, settle, set_environment), the identities of q and held (a
+fork's first write copies them), the rate (a scalar, or a digest of its field), the solver and the window, and returns
+it with the new times and what depends on dt (the rate's integral, the privilege). Tested receipt by receipt against the
+computed step and against each act's invalidation (tests/world/test_world_acts.py). Measured: a resting 192 x 256 paste,
+231 ms a step computed, 0.2 ms recalled.
+
+*Compiled kernels.* The local step's Newton update is compiled with numba (goo/world/kernels.py): per cell, no threads,
+fastmath off, cached on disk; it gave the numpy version's bits on the painter's scenes. For one volatile and no pores
+(K = 1) the residual is increasing in e, so each evaluation brackets the root and a Newton step that leaves the bracket
+is replaced by its midpoint: where Newton stays inside the iterates are unchanged; at a vitrifying gum film (water's
+potential bends sharply at the glass transition) it two-cycled and the step halved 516 times in 300 s of drying.
+*Potentials without Hessians.* Where a substep needs μ and not the Hessian (the ray, the flow's transport term, the
+local step's bracketing and drain tests, F's mixing term) the world calls the protocol's optional
+`mixing_potentials` (the same values, no [S, S, n] array), and the ray's δᵀHδ comes from `mixing_hvp`; a constitutive
+object without them is served by `mixing`. The maps are not
+compiled by the world (SPEC §4.4): they are most of the local step's time (measured: 57 % of it on a 197k-cell paste).
 
 *settle()* retires every wet cell whose viscosity is +inf (no liquid left, or jammed particles): mobility is
 exactly zero there, so retiring loses no freedom. A film that still holds a liquid is not touched.

@@ -149,12 +149,25 @@ def test_exchange_of_water():
     assert maps.evaporation(warm, env)["water"].p_sat.value[0, 0] == pytest.approx(3.17 * kPa, rel=0.01)   # vs 3.169
 
 
-@pytest.mark.xfail(reason="Hildebrand's regular solution has no hydrogen bonding: it predicts water and ethanol "
-                          "separate (B = 4.8e8 J/m^3 against a critical 1.6e8); they mix in every proportion",
-                   strict=True)
 def test_water_and_ethanol_mix():
-    e = maps.evaporation(film({L.WATER: 10 * um, L.ETHANOL: 10 * um}), maps.Atmosphere())
+    """Hansen's split of the cohesive energy (hydrogen bonds both make cost nothing to mix) gives B = 1.46e8 J/m^3
+    against the Flory-Huggins critical 1.63e8: one phase at every proportion. (Hildebrand gave 4.8e8 and separation.)"""
+    from goo.substance import _freeenergy as fe
+    B, rule = fe.pair_interaction(L.WATER, L.ETHANOL)
+    crit = 0.5 * k_B * T_room * (L.WATER.molecular_volume ** -0.5 + L.ETHANOL.molecular_volume ** -0.5) ** 2
+    assert rule == "hansen" and B < 0.95 * crit
+    y = np.linspace(0.01, 0.99, 99)
+    q = np.stack([y * 20 * um, (1 - y) * 20 * um])[:, None, :]
+    f = Film((L.WATER, L.ETHANOL), q)
+    e = maps.evaporation(f, maps.Atmosphere())
     assert np.all(e["ethanol"].activity.value <= 1.0) and np.all(e["water"].activity.value <= 1.0)
+    H = maps.mixing(f).value.hess[:, :, 0, :]
+    # the total free energy's curvature along composition (convex part + concave part's B - beta I), positive
+    Hx = (fe.MixSet.of(f.substances).B - fe.MixSet.of(f.substances).beta * np.eye(2))
+    d = np.array([1.0, -1.0])
+    curv = np.einsum("i,ijn,j->n", d, H, d) + (d @ Hx @ d) / f.h[0] * (1 - 0)   # (q^T M q / h)'' along d at fixed h
+    assert np.all(curv > 0)
+    assert np.all(maps.viscosity(f).in_domain)                 # no "separate" reason
 
 
 def test_yield_stress_bounds_and_limits():

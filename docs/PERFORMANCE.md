@@ -667,3 +667,51 @@ CUDA bindings, and no garbage collector. Go's compiler does little auto-vectoris
 weaker GPU access, and its garbage collector and cgo overhead are poorly suited to millions of small per-cell
 records. For this workload Rust is the better fit (an opinion from recalled language properties, not a
 measurement).
+
+---
+
+## 9. Stage 1 as built (dynamics owner, 2026-11-15/16)
+
+What changed in `goo/world` (the arguments are in docs/DYNAMICS.md §4.2a, §4.3 and §9a):
+
+- **1a, advance.** The step reports `max relative change`. advance scales its error estimate by min(1, change/0.1),
+  halves the next step above a change of 0.25, and doubles only below it.
+- **1b, rest memo.** A step whose every substep left on an old-state-only exit is recalled until the state version,
+  q's or held's identity, the rate, the solver or the window changes.
+- **1c, diffusion by the ray.** D_num ≥ 0 by construction. Newton is the fallback on entry, on non-finite potentials,
+  and when t < 0.9.
+- **1d, local Newton update in numba** (`goo/world/kernels.py`). Per cell, no threads, fastmath off, cached. For one
+  volatile it adds a bracket safeguard.
+
+**After the substance maps' rework:**
+- the drain rule extended to cells of several substances;
+- `mixing_potentials` and `mixing_hvp` adopted where no Hessian is needed;
+- `mixing_hvp` called in blocks of 32,768 cells, to avoid a defect in `goo.substance._freeenergy.hvp`: the name `sel`
+  is reused inside its loop over chunks, giving a wrong index or a 42 GB allocation above 65,536 distinct
+  compositions.
+
+**Measured on 96 x 128 and 48 x 64** (this machine, old maps unless said):
+- **Drying the paste for an hour:** 5,516 → 144 steps (96 x 128, old maps); 158 steps with the new maps
+  (48 x 64, test). The new maps' film dries fast and then vitrifies; settle() retires all of it.
+- **A resting paste:** 231 ms computed, 0.2 ms recalled (192 x 256).
+- **Diffusion by the ray:** 0.44 → 0.10 s at 49k cells; it matches the fine reference better than implicit Euler
+  (§2.4).
+- **Local:** 0.86 → 0.77 s at 197k cells, bit-identical. The world's share is small: the maps are 57% of the local
+  substep.
+
+**Measured on 1024 x 768 (786,432 cells), library maps of 2026-11-15**, while another agent's tests held this
+machine's effective single core at times, so the wall times are upper bounds:
+
+| | before stage 1 | after stage 1 |
+|---|---|---|
+| quiet step (paste, evaporating) | 20.7 s, 2.98 GB | 13.7 to 14.4 s, 3.07 GB (the first step, from the initial condition, falls back to Newton: 41 s) |
+| share in `goo.substance` maps (profile at 197k cells) | | 1.53 of 2.85 s (`_freeenergy.evaluate`), plus 0.26 s in exchange |
+| old maps with particle mobility 0 (`bench/noparticle.py`) | 7.5 s | 6.3 to 6.9 s; an hour of drying in about 148 steps, about 985 s of wall time |
+| drying a full-panel 30 um paste until settle() retires it | | see PROGRESS.md and the report (run in progress at the time of writing) |
+
+**Reading.** With the real maps the world's own arithmetic is now the smaller part of a quiet step. What remains:
+- the maps' evaluations: 7 full `mixing`, about 6 `mixing_potentials` and 3 `mixing_hvp` calls per step;
+- the Newton fallback on a step whose ray falls short.
+
+The next speed-up of the quiet step lies in the maps (a compiled per-cell kernel the world can call, signature in
+the report) and in fewer map calls per step (the substeps re-evaluate at states another substep already evaluated).

@@ -70,24 +70,67 @@ def mixing(ctx, qc):
         return None
     # the maps are functions of the amounts, so the same amounts give the same numbers: the last few evaluations of
     # a piece are kept and returned for equal input (bit for bit), which the substeps meet at their boundaries
+    return _memo(ctx, qc, True)
+
+
+def mixing_potentials(ctx, qc):
+    """As mixing() but the Hessian may be None: through the protocol's optional `mixing_potentials` (the same values
+    without the [S, S, n] Hessian), else mixing() itself."""
+    return _memo(ctx, qc, False)
+
+
+def _memo(ctx, qc, hess):
+    if getattr(ctx.con, "mixing", None) is None:
+        return None
+    # the maps are functions of the amounts, so the same amounts give the same numbers: the last few evaluations of
+    # a piece are kept and returned for equal input (bit for bit), which the substeps meet at their boundaries
     memo = ctx.memo
     if memo is not None:
         for k, (qm, out) in enumerate(memo):
-            if qm.shape == qc.shape and np.array_equal(qm, qc):
+            if qm.shape == qc.shape and np.array_equal(qm, qc) and (out[2] is not None or not hess):
                 return out
-    out = _mixing(ctx, qc)
-    if memo is not None:
+    if hess or getattr(ctx.con, "mixing_potentials", None) is None:
+        out = _mixing(ctx, qc)
+    else:
+        out = _mixing(ctx, qc, ctx.con.mixing_potentials)
+    if memo is not None and out is not None:
         memo.insert(0, (np.array(qc, copy=True), out))
         del memo[MEMO:]
     return out
 
 
+def mixing_hvp(ctx, qc, dq):
+    """The convex mixing Hessian applied to dq [S, n] on compacted cells qc, 0 for absent substances: through the
+    protocol's optional `mixing_hvp` (no [S, S, n] array), else from mixing()'s Hessian."""
+    fn = getattr(ctx.con, "mixing_hvp", None)
+    present = qc > 0
+    if fn is None:
+        H = mixing(ctx, qc)[2]
+        return np.where(present, np.einsum("ijn,jn->in", H, np.where(present, dq, 0.0)), 0.0)
+    from goo.world.protocol import unwrap
+    S, n = qc.shape
+    dqm = np.where(present, dq, 0.0)
+    out = np.empty((S, n))
+    # in blocks of cells: the map is element-wise, so blocks change nothing; and goo.substance's hvp of 2026-11-15
+    # reuses a name inside its loop over chunks of 65536 distinct compositions (wrong index, or a 42 GB allocation, on a
+    # larger call), which blocks of HVP_BLOCK cells never reach
+    for b0 in range(0, n, HVP_BLOCK):
+        sl = slice(b0, min(n, b0 + HVP_BLOCK))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            v = unwrap(fn(Film(ctx.substances, qc[:, None, sl]), dqm[:, None, sl], ctx.env.T), "mixing_hvp", ctx.flags)
+        out[:, sl] = np.asarray(v, np.float64).reshape(S, -1)
+    return np.where(present, out, 0.0)
+
+
+HVP_BLOCK = 32768
+
+
 MEMO = 3
 
 
-def _mixing(ctx, qc):
+def _mixing(ctx, qc, fn=None):
     S, n = qc.shape
-    fn = ctx.con.mixing
+    fn = ctx.con.mixing if fn is None else fn
     with np.errstate(divide="ignore", invalid="ignore"):
         from goo.world.protocol import unwrap
         mx = unwrap(fn(Film(ctx.substances, qc[:, None, :]), ctx.env.T), "mixing", ctx.flags)
@@ -100,7 +143,7 @@ def _mixing(ctx, qc):
     f = np.where(wet, np.asarray(mx.f, np.float64).reshape(n), 0.0)
     mu = np.where(present, np.asarray(mx.mu, np.float64).reshape(S, n), 0.0)
     pp = present[:, None, :] & present[None, :, :]
-    H = np.where(pp, np.asarray(mx.hess, np.float64).reshape(S, S, n), 0.0)
+    H = None if mx.hess is None else np.where(pp, np.asarray(mx.hess, np.float64).reshape(S, S, n), 0.0)
     fx = np.zeros(n) if mx.f_x is None else np.where(wet, np.asarray(mx.f_x, np.float64).reshape(n), 0.0)
     mux = np.zeros((S, n)) if mx.mu_x is None else np.where(present, np.asarray(mx.mu_x, np.float64).reshape(S, n), 0.0)
     return f, mu, H, fx, mux

@@ -52,7 +52,7 @@ def _params_read(cls, d, where, errors, warns):
             continue
         n = names[k]
         if isinstance(x, list):
-            out[n] = tuple(tuple(float(y) for y in row) for row in x)
+            out[n] = tuple(tuple(y if isinstance(y, str) else float(y) for y in row) for row in x)   # (name, number) pairs keep their names
             continue
         if n not in RANGE:
             warns.append(f"{where}.{k}: no plausible range known for this field; unit not checked")

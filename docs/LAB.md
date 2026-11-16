@@ -54,7 +54,8 @@ What the rule gives, and what it shows about the maps:
   linoxyn are guesses, whatever the pigment.
 - **Water with gum arabic** loses water to activity 0.5. The dry film keeps ~22 % water by volume (Flory-Huggins with
   the Hildebrand interaction). For gum arabic that is not absurd.
-- **Negative result.** For particles in water (the acrylic latex, or pigment in water alone) the same mixing model
+- **Negative result, corrected since.** The maps now treat particles as a colloid, and a film of particles in
+  water alone dries to no water at all (docs/SUBSTANCES.md; tests/lab/test_lab_dry.py). As first found: for particles in water (the acrylic latex, or pigment in water alone) the same mixing model
   keeps ~23 % water by volume at 50 % RH: `chemical_potential` gives a particle the entropy of a polymer chain of
   lattice sites, so water's activity is phi_w exp(1 - phi_w), as if dissolved in the particles. A real powder at 50 %
   RH holds only an adsorbed layer. The dry films of the acrylic and of search (b) are therefore wetter than they should

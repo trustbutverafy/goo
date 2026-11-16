@@ -1,3 +1,4 @@
+import warnings
 """goo.lab.search and the command line, on small budgets. Owner: lab."""
 import json, warnings
 import numpy as np, pytest
@@ -72,4 +73,7 @@ def test_fast_optical_is_the_maps_rearranged_and_defers_to_them_when_voids_appea
     assert np.array_equal(n1, n0)
     dry_water = S.film_of(s, R.WATER, 0.5)                       # underbound: voids, so the maps answer it whole
     out = S.FastOptical(s).optical(dry_water, B)
-    assert type(out.K).__name__ == "Bounded"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ref = maps.optical(dry_water, B)
+    assert type(out.K) is type(ref.K)                            # deferred to the maps: whatever they answer
