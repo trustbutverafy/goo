@@ -375,7 +375,8 @@ K1  docs/DYNAMICS.md; the step with O1 to O8 on the first terms              bui
     the painter's cases (pigment in gum water drying, two paints meeting wet, a tilt, a pour over strata, a paste, a
     latex-thickened paint) step on 96 x 96 and 160 x 120 panels (tests/world/test_world_painting.py); a step is all or
     nothing; amounts below one molecule a cell are carried but do not diffuse (DYNAMICS.md, rule R7)
-    owed: speed (a quiet step on 1024 x 768 takes 16 to 30 s; moving paint at 300,000 cells is out of reach); a
+    owed: speed, by the staged plan of docs/PERFORMANCE.md (a quiet step on 1024 x 768 takes 16 s with particle
+    mobility zeroed and does not finish with the real maps, whose particle thermodynamics is wrong); a
     gum-bound film never reaches a state `settle()` retires (its viscosity stays finite); pore water does not
     evaporate; cure (needs the reaction's free energy) and dissolution (xfail); surface tension is lagged
 K2  light on the first rung with G1 to G7                                    built; owner's tests pass (tests/light/); not yet refereed
