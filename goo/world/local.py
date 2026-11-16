@@ -1,6 +1,6 @@
 """Substep 3: exchange with the atmosphere and sorption into the ground, cell by cell (DYNAMICS.md §4.3)."""
 import numpy as np
-from goo.world.common import Reject, coeff, mixing, mixing_potentials, dF_grav, dF_cap, dF_wet, dF_exch, mu_wet, pore_B
+from goo.world.common import Reject, coeff, mixing, mixing_potentials, mixing_block, dF_grav, dF_cap, dF_wet, dF_exch, mu_wet, pore_B
 from goo.world.grid import capillary_pressure
 from goo.world.kernels import local_newton_update
 
@@ -58,7 +58,7 @@ def local(ctx, q, held, dt):
     zb = ctx.zb[cells]
     gexp = -gn * (m0 - a_ * h0)[None, :] * (rho[:, None] - a_) / (4 * a_)
     base = (gn * rho[:, None] * zb[None, :] + gexp + (Pc - sig * h0 + mw)[None, :] + rho[:, None] * psi[None, :])
-    mx0 = mixing(ctx, q0)
+    mx0 = mixing_potentials(ctx, q0)          # its Hessian is never read: the Newton's cells get theirs below
     nonmix = mx0 is None
     if nonmix:
         mx0 = (np.zeros(n), np.zeros((S, n)), np.zeros((S, S, n)), np.zeros(n), np.zeros((S, n)))
@@ -79,21 +79,20 @@ def local(ctx, q, held, dt):
         if not nonmix:
             mm = ~sg
             if mm.all():
-                mxx = mixing(ctx, qp) if need_hess else mixing_potentials(ctx, qp)
+                # the Newton needs the Hessian only on the substances that exchange or sorb (hrows)
+                mxx = mixing_block(ctx, qp, hrows) if need_hess else mixing_potentials(ctx, qp)
                 mu_c, Hm = mxx[1], (mxx[2] if need_hess else None)
             else:
                 mu_c = mx0[1][:, idx].copy()
                 if need_hess:
-                    Hm = mx0[2][:, :, idx].copy()
+                    raise AssertionError("local: the Newton's cells are never single-substance cells")
                 if mm.any():
-                    mxx = mixing(ctx, qp[:, mm]) if need_hess else mixing_potentials(ctx, qp[:, mm])
+                    mxx = mixing_potentials(ctx, qp[:, mm])
                     mu_c[:, mm] = mxx[1]
-                    if need_hess:
-                        Hm[:, :, mm] = mxx[2]
         else:
             mu_c = np.zeros_like(qp)
         if Hm is None and need_hess:
-            Hm = np.zeros((S, S, idx.size))
+            Hm = np.zeros((hrows.size, hrows.size, idx.size))
         hp, mp = qp.sum(0), rho @ qp
         mul = (mu_c + mux0[:, idx] + base[:, idx] + gn * (mp + a_ * hp)[None, :] * (rho[:, None] + a_) / (4 * a_)
                + sig[idx][None, :] * hp[None, :])
@@ -123,8 +122,9 @@ def local(ctx, q, held, dt):
     if cand.size:
         ic = dsub[cand]; kc = np.arange(cand.size)
         T = q0[ic, cand]
-        # mu_i is increasing in q_i: at q0 it bounds what the step can take from above (one map call, no Hessian)
-        mu_hi = potentials(q0[:, cand], cand, need_hess=False)[0][ic, kc]
+        # mu_i is increasing in q_i: at q0 it bounds what the step can take from above (the potentials at q0, whose
+        # mixing part is mx0's: no map call)
+        mu_hi = potentials(q0, np.arange(n), need_hess=False)[0][ic, cand]
         th0 = w0[cand] / C if C > 0 else np.zeros(cand.size)
         mup0 = -P[ic, cand] + Pb[cand] * th0 / (1 - th0)
         upper = (np.where(Eon[ic, cand], np.maximum(ke[ic, cand] * (mu_hi - menv[ic]), 0.0), 0.0)
@@ -156,6 +156,8 @@ def local(ctx, q, held, dt):
     if K == 0:
         live = live[:0]
     IK = np.eye(K)
+    hrows = np.unique(np.concatenate([ie, ia])).astype(np.int64)    # the Hessian's rows the Newton reads
+    hpos = np.full(S, -1, np.int64); hpos[hrows] = np.arange(hrows.size)
     elo, ehi = np.full(n, -np.inf), np.full(n, np.inf)      # the scalar Newton's brackets (kernels.py)
     gJ = np.asarray(gJ)
     for it in range(MAX_NEWTON):
@@ -166,7 +168,7 @@ def local(ctx, q, held, dt):
         mu, Hm = potentials(qp, idx)
         # the Newton update, per cell, compiled (goo/world/kernels.py): the residual, the Jacobian, the limited step
         done = local_newton_update(idx, np.ascontiguousarray(mu), np.ascontiguousarray(Hm), e, av, Eon, Son, ke, ks,
-                                   menv, P, Pb, w0, float(C), sig, gJ, ie, ia, single, q0, h0, elo, ehi)
+                                   menv, P, Pb, w0, float(C), sig, gJ, ie, ia, single, q0, h0, elo, ehi, hpos)
         live = idx[~done]
     else:
         raise Reject("local: Newton did not converge")

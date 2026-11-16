@@ -109,20 +109,11 @@ def mixing_hvp(ctx, qc, dq):
         return np.where(present, np.einsum("ijn,jn->in", H, np.where(present, dq, 0.0)), 0.0)
     from goo.world.protocol import unwrap
     S, n = qc.shape
-    dqm = np.where(present, dq, 0.0)
-    out = np.empty((S, n))
-    # in blocks of cells: the map is element-wise, so blocks change nothing; and goo.substance's hvp of 2026-11-15
-    # reuses a name inside its loop over chunks of 65536 distinct compositions (wrong index, or a 42 GB allocation, on a
-    # larger call), which blocks of HVP_BLOCK cells never reach
-    for b0 in range(0, n, HVP_BLOCK):
-        sl = slice(b0, min(n, b0 + HVP_BLOCK))
-        with np.errstate(divide="ignore", invalid="ignore"):
-            v = unwrap(fn(Film(ctx.substances, qc[:, None, sl]), dqm[:, None, sl], ctx.env.T), "mixing_hvp", ctx.flags)
-        out[:, sl] = np.asarray(v, np.float64).reshape(S, -1)
-    return np.where(present, out, 0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        v = unwrap(fn(Film(ctx.substances, qc[:, None, :]), np.where(present, dq, 0.0)[:, None, :], ctx.env.T),
+                   "mixing_hvp", ctx.flags)
+    return np.where(present, np.asarray(v, np.float64).reshape(S, n), 0.0)
 
-
-HVP_BLOCK = 32768
 
 
 MEMO = 3
@@ -196,3 +187,28 @@ def mu_wet(ctx, h, cells=None):
 
 def pore_B(theta):
     return -theta - np.log1p(-theta)
+
+
+def mixing_block(ctx, qc, rows):
+    """(f, mu, Hb [R, R, n], f_x, mu_x) on compacted cells: the convex Hessian only on the substances `rows`, through the
+    protocol's optional `mixing_block`, else cut from mixing()'s Hessian. Absent substances' entries are 0."""
+    rows = np.asarray(rows, np.int64)
+    fn = getattr(ctx.con, "mixing_block", None)
+    if fn is None:
+        mx = mixing(ctx, qc)
+        return mx[0], mx[1], mx[2][np.ix_(rows, rows)], mx[3], mx[4]
+    from goo.world.protocol import unwrap
+    S, n = qc.shape
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mx = unwrap(fn(Film(ctx.substances, qc[:, None, :]), rows, ctx.env.T), "mixing", ctx.flags)
+    if not hasattr(mx, "f"):
+        mx = Mixing(*mx)
+    present = qc > 0
+    wet = qc.sum(0) > 0
+    f = np.where(wet, np.asarray(mx.f, np.float64).reshape(n), 0.0)
+    mu = np.where(present, np.asarray(mx.mu, np.float64).reshape(S, n), 0.0)
+    pr = present[rows]
+    Hb = np.where(pr[:, None, :] & pr[None, :, :], np.asarray(mx.hess, np.float64).reshape(rows.size, rows.size, n), 0.0)
+    fx = np.zeros(n) if mx.f_x is None else np.where(wet, np.asarray(mx.f_x, np.float64).reshape(n), 0.0)
+    mux = np.zeros((S, n)) if mx.mu_x is None else np.where(present, np.asarray(mx.mu_x, np.float64).reshape(S, n), 0.0)
+    return f, mu, Hb, fx, mux

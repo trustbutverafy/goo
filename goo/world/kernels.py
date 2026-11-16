@@ -10,9 +10,10 @@ from numba import njit
 
 @njit(cache=True, fastmath=False, nogil=True)
 def local_newton_update(idx, mu, Hm, e, av, Eon, Son, ke, ks, menv, P, Pb, w0, C, sig, gJ, ie, ia, single, q0, h0,
-                        elo, ehi):
+                        elo, ehi, hpos):
     """One Newton iteration of the local step (goo/world/local.py) on the live cells idx, in place on e, av [S, n].
-    mu [S, m] the film's potentials and Hm [S, S, m] the mixing Hessian at the iterate (m = idx.size). The unknowns are
+    mu [S, m] the film's potentials and Hm [R, R, m] the mixing Hessian's block on the substances that exchange or sorb at
+    the iterate (m = idx.size; hpos [S] maps a substance to its row of the block). The unknowns are
     e_i (i in ie) and a_i (i in ia); the residual, the Jacobian, the step limited to 0.9 of what is held and to 0.9 of
     the pores' free space, and the stopping rule are local.py's. The K x K system is solved by Gaussian elimination with
     partial pivoting in a fixed order (K is 1 for one volatile and no pores: the scalar formula of local.py). Returns
@@ -71,14 +72,14 @@ def local_newton_update(idx, mu, Hm, e, av, Eon, Son, ke, ks, menv, P, Pb, w0, C
                 elo[j] = e[i0, j]
             elif R[0] > 0.0 and e[i0, j] < ehi[j]:
                 ehi[j] = e[i0, j]
-            Jd = kk[0] * (Hm[i0, i0, c] + gJ[i0, i0] + sig[j]) + 1.0
+            Jd = kk[0] * (Hm[hpos[i0], hpos[i0], c] + gJ[i0, i0] + sig[j]) + 1.0
             d[0] = -R[0] / Jd
         else:
             for r in range(K):
                 ir = ie[r] if r < ne else ia[r - ne]
                 for s in range(K):
                     is_ = ie[s] if s < ne else ia[s - ne]
-                    J[r, s] = kk[r] * (Hm[ir, is_, c] + gJ[ir, is_] + sig[j])
+                    J[r, s] = kk[r] * (Hm[hpos[ir], hpos[is_], c] + gJ[ir, is_] + sig[j])
                     if r >= ne and s >= ne:
                         J[r, s] += kk[r] * Jp
                     if r == s:

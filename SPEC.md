@@ -375,10 +375,12 @@ K1  docs/DYNAMICS.md; the step with O1 to O8 on the first terms              bui
     the painter's cases (pigment in gum water drying, two paints meeting wet, a tilt, a pour over strata, a paste, a
     latex-thickened paint) step on 96 x 96 and 160 x 120 panels (tests/world/test_world_painting.py); a step is all or
     nothing; amounts below one molecule a cell are carried but do not diffuse (DYNAMICS.md, rule R7)
-    owed: speed, by the staged plan of docs/PERFORMANCE.md (a quiet step on 1024 x 768 takes 16 s with particle
-    mobility zeroed and does not finish with the real maps, whose particle thermodynamics is wrong); a
-    gum-bound film never reaches a state `settle()` retires (its viscosity stays finite); pore water does not
-    evaporate; cure (needs the reaction's free energy) and dissolution (xfail); surface tension is lagged
+    stage 1 of docs/PERFORMANCE.md is in: a drying run takes about 150 steps, not 5,500; a quiet step on 1024 x 768
+    with the real maps takes 5.5 to 6.3 s and 1.7 GB; a full-panel 30 um paste of water, gum arabic and rutile dries
+    until settle() retires every cell in 12 minutes of wall time
+    owed: stages 2 and 3 (activity per substep; multigrid flow: moving paint at 300,000 cells is still out of
+    reach); particle mobility through the Onsager matrix is about 1e-16 m^2/s where Stokes-Einstein gives 1e-12;
+    pore water does not evaporate; cure and dissolution (xfail); surface tension is lagged
 K2  light on the first rung with G1 to G7                                    built; owner's tests pass (tests/light/); not yet refereed
 K3  ports, the first bodies, journal, replay, clocks                         built without a mechanical port: paints, vessels, pour, flood, drop, drip,
     spray, tape, tilt, air, wait, hold, settle; a journal with bit-identical replay; a command line; owner's tests pass

@@ -333,8 +333,9 @@ def _rows(U, sel, rows):
     return U[np.ix_(sel, rows)]
 
 
-def evaluate(ms, q, T, need_hess=True):
-    """f [N], mu [S, N], hess [S, S, N] (or None), f_x [N], mu_x [S, N] on cells q [S, N] at T [N]."""
+def evaluate_reference(ms, q, T, need_hess=True):
+    """f [N], mu [S, N], hess [S, S, N] (or None), f_x [N], mu_x [S, N] on cells q [S, N] at T [N]: the numpy
+    reference of the compiled evaluate() (once per distinct composition)."""
     S, N = q.shape
     h = q.sum(0)
     wet = h > 0
@@ -379,8 +380,8 @@ def evaluate(ms, q, T, need_hess=True):
     return f, mu, H, fx, mux
 
 
-def hvp(ms, q, T, dq, chunk=65536):
-    """The convex Hessian applied to dq [S, N], per cell, without forming [S, S, N]: blocks of the present substances
+def hvp_reference(ms, q, T, dq, chunk=65536):
+    """The numpy reference of hvp(): the convex Hessian applied to dq [S, N], per cell, without forming [S, S, N]: blocks of the present substances
     on the distinct compositions, applied chunk by chunk."""
     S, N = q.shape
     h = q.sum(0)
@@ -409,3 +410,45 @@ def hvp(ms, q, T, dq, chunk=65536):
                 acc += Hr[:, b, j] * d[b]
             out[np.ix_(k, wi[cs])] = acc / hw[cs]
     return out
+
+
+# ------------------------------------------------------------------------------------- the compiled path (default)
+def _entry_arrays(ms, T):
+    """x_e and A of every particle population at each cell's temperature, [S, N] (0 for liquids)."""
+    T = np.asarray(T, float)
+    xe = np.zeros((ms.S, T.size)); A = np.zeros((ms.S, T.size))
+    for i in np.flatnonzero(ms.part):
+        xe[i], A[i] = ms.entry(i, T)
+    return xe, A
+
+
+def _compiled(ms, q, T, dq, mode, rows=None):
+    from goo.substance._mixkernel import evaluate_cells, _KB
+    assert _KB == k_B
+    S, N = q.shape
+    T = np.broadcast_to(np.asarray(T, float), (N,))
+    kT = k_B * T * np.ones(N)
+    xe, A = _entry_arrays(ms, T)
+    q = np.ascontiguousarray(q, dtype=np.float64)
+    d = np.zeros((1, 1)) if dq is None else np.ascontiguousarray(dq, dtype=np.float64)
+    rows = np.zeros(0, np.int64) if rows is None else np.asarray(rows, np.int64)
+    return evaluate_cells(q, kT, ms.part, ms.c, ms.B, float(ms.beta), np.nan_to_num(ms.phim), ms.Pi_e, xe, A,
+                          mode != 0, d, mode, rows)
+
+
+def evaluate(ms, q, T, need_hess=True):
+    """f [N], mu [S, N], hess [S, S, N] (or None), f_x [N], mu_x [S, N] on cells q [S, N] at T [N]: the compiled
+    per-cell kernel (goo/substance/_mixkernel.py), equal to evaluate_reference to rounding."""
+    f, mu, H, fx, mux, _ = _compiled(ms, q, T, None, 1 if need_hess else 0)
+    return f, mu, (H if need_hess else None), fx, mux
+
+
+def hvp(ms, q, T, dq, chunk=None):
+    """The convex Hessian applied to dq [S, N], per cell, without forming [S, S, N] (compiled)."""
+    return _compiled(ms, q, T, dq, 2)[5]
+
+
+def evaluate_block(ms, q, T, rows):
+    """f, mu, the convex Hessian's block on the substances `rows` [R, R, N], f_x, mu_x (compiled)."""
+    f, mu, H, fx, mux, _ = _compiled(ms, q, T, None, 3, rows)
+    return f, mu, H, fx, mux

@@ -167,6 +167,23 @@ class _F:
         self.mult = mult                                         # [H, W] how many cells each point stands for
 
     @classmethod
+    def lite(cls, film, T=None):
+        """What the mixing entry points read (substances, q, T, which substances are present), without the arrays the
+        other maps need (phi, P, L): the same values of those fields as of() gives."""
+        st = getattr(film, "state", {}) or {}
+        if T is None:
+            T = st.get("temperature", T_room)
+        F = cls.__new__(cls)
+        F.subs = tuple(film.substances)
+        F.q = np.asarray(film.q, float)
+        F.shape = F.q.shape[1:]
+        F.T = np.broadcast_to(np.asarray(T, float), F.shape)
+        F.part = np.array([s.morph is not None for s in F.subs], bool)
+        S = len(F.subs)
+        F.present = (F.q.reshape(S, -1) > 0).any(1) if F.q.size else np.zeros(S, bool)
+        return F
+
+    @classmethod
     def of(cls, film, T=None):
         st = getattr(film, "state", {}) or {}
         if T is None:
@@ -1010,7 +1027,7 @@ def mixing(film, T=None):
     At an absent substance with a mixing unit mu is -inf, its hess entries are 0; on an empty cell f = f_x = 0,
     mu_x = 0, hess = 0. Cost: what the cells' compositions cost: each distinct (volume fractions, T) is solved once,
     on the substances present in it. Evidence: at best assumed. See also `mixing_potentials`, `mixing_hvp`."""
-    F = _F.of(film, T)
+    F = _F.lite(film, T)
     S = len(F.subs)
     ms = _fe.MixSet.of(F.subs)
     f, mu, H, fx, mux = _fe.evaluate(ms, F.q.reshape(S, -1), F.T.reshape(-1), need_hess=True)
@@ -1028,7 +1045,7 @@ def _mix_text(ms):
 def mixing_potentials(film, T=None):
     """`mixing` without its Hessian: MixingTerms(f, mu, None, f_x, mu_x), the same arrays bit for bit, at a
     fraction of the cost (no [S, S, H, W] array). For callers that need potentials only."""
-    F = _F.of(film, T)
+    F = _F.lite(film, T)
     S = len(F.subs)
     ms = _fe.MixSet.of(F.subs)
     f, mu, _, fx, mux = _fe.evaluate(ms, F.q.reshape(S, -1), F.T.reshape(-1), need_hess=False)
@@ -1041,12 +1058,27 @@ def mixing_hvp(film, dq, T=None):
     """The convex part's Hessian applied to dq [S, H, W] (m), per cell: [S, H, W] J/m^3, equal to
     einsum('ijc,jc->ic', mixing(film).hess, dq) without materialising the Hessian (each cell's block is formed on
     its present substances only and discarded). Entries of absent substances are 0, as in `mixing`."""
-    F = _F.of(film, T)
+    F = _F.lite(film, T)
     S = len(F.subs)
     ms = _fe.MixSet.of(F.subs)
     q = F.q.reshape(S, -1); dqf = np.asarray(dq, float).reshape(S, -1)
     out = _fe.hvp(ms, q, F.T.reshape(-1), dqf)
     return derive(out.reshape(F.q.shape), _mix_evidence(F), map="mixing_hvp")
+
+
+def mixing_block(film, rows, T=None):
+    """`mixing` with only the block of its Hessian on the substances `rows` (indices into film.substances):
+    MixingTerms(f, mu, hess [R, R, H, W], f_x, mu_x), the block equal to mixing(film).hess[rows][:, rows]. For
+    callers that need a few rows of the Hessian (goo.world's local step: the substances that exchange or sorb)."""
+    F = _F.lite(film, T)
+    S = len(F.subs)
+    ms = _fe.MixSet.of(F.subs)
+    rows = np.asarray(rows, np.int64)
+    f, mu, Hb, fx, mux = _fe.evaluate_block(ms, F.q.reshape(S, -1), F.T.reshape(-1), rows)
+    shp = F.shape
+    out = MixingTerms(f.reshape(shp), mu.reshape((S,) + shp), Hb.reshape((rows.size, rows.size) + shp), fx.reshape(shp),
+                      mux.reshape((S,) + shp))
+    return derive(out, _mix_evidence(F), map=_mix_text(ms))
 
 
 def mobility(film):

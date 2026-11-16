@@ -1,6 +1,7 @@
 """Substep 2: relative fluxes of the substances at fixed thickness, Onsager form (DYNAMICS.md §3, §4.2)."""
 import numpy as np
 import scipy.sparse as sp
+from goo.units import k_B
 from goo.world.linsolve import Inner
 from goo.world.common import Reject, coeff, mixing, mixing_potentials, mixing_hvp, dF_grav, dF_cap, dF_wet, dF_exch
 
@@ -355,40 +356,63 @@ def _ray(ctx, q0, sa, kap, iL, iR, hc, mux0a, grava, mx0, dt, dx):
     if not T >= RAY_MIN:
         return None
     dx2 = dx ** 2
-    glin = dx2 * float(np.sum((mux0a + grava) * delta))
+    # Phi'(0) by summation by parts, face by face: dx^2 <mu(q0), delta> = -dt dx^2 sum_f j . X (an identity), so it is
+    # computed without the cancellation of potentials of 1e9 J/m^3 summed over the cells; Phi'(t) - Phi'(0) is then a
+    # sum of per-cell differences of potentials, small numbers known to their own rounding
+    P = dt * dx2 * float(np.sum(omg * Xr * X))
+    mu0c = np.where(q0a > 0, mx0[1][sa], 0.0)
     qfull = q0.copy()
 
     def deriv(t, second):
         qt = q0a + t * delta
         qfull[sa] = qt
         mx = mixing_potentials(ctx, qfull)
-        d1 = dx2 * float(np.sum(np.where(qt > 0, mx[1][sa], 0.0) * delta)) + glin + t * D1
+        d1 = -P + dx2 * float(np.sum((np.where(qt > 0, mx[1][sa], 0.0) - mu0c) * delta)) + t * D1
         if not second:
             return d1, None
         dfull = np.zeros_like(qfull); dfull[sa] = delta
         d2 = dx2 * float(np.sum(mixing_hvp(ctx, qfull, dfull)[sa] * delta)) + D1      # delta^T H delta, no Hessian
         return d1, d2
-    lo, hi = 0.0, T                                    # Phi'(lo) <= 0 (at 0 it is -D1); Phi'(hi) > 0 unless hi = T is taken
-    d1, d2 = deriv(T, True)
+    # Phi' is increasing (Phi convex): Phi'(0) = -D1 is known without evaluating; at T one potential evaluation. If
+    # Phi'(T) <= 0 the step is T. Else the root is bracketed in (0, T) and found by the Illinois variant of regula falsi
+    # on Phi' (no Hessian: each iteration one potential evaluation), keeping lo with Phi'(lo) <= 0 as computed.
+    if not P > 0:
+        # no descent to the rounding of the forces: if what the flux would dissipate is below k_B T per cell of the
+        # solve (the energy floor of the receipts), there is nothing to resolve and the step is no flux (admissible:
+        # D_num = 0); else the Newton decides
+        if D1 <= k_B * float(np.mean(ctx.env.T)) * n:
+            return 0.0, q0a.copy(), 0.0
+        return None
+    lo, hi = 0.0, T
+    flo, fhi = -P, None
+    d1, _ = deriv(T, False)
     if not np.isfinite(d1):
         return None
     if d1 <= 0.0:
         t = T
     else:
-        t = T
+        fhi = d1
+        side = 0
         for _ in range(RAY_ITERS):
-            tn = t - d1 / d2 if (d2 is not None and d2 > 0) else 0.5 * (lo + hi)
+            tn = (lo * fhi - hi * flo) / (fhi - flo)
             if not (lo < tn < hi):
                 tn = 0.5 * (lo + hi)
-            d1, d2 = deriv(tn, True)
+            d1, _ = deriv(tn, False)
             if not np.isfinite(d1):
                 return None
             if d1 <= 0.0:
-                lo = tn
+                lo, flo = tn, d1
+                if side == -1:
+                    fhi *= 0.5
+                side = -1
             else:
-                hi = tn
-            t = tn
-            if hi - lo <= 1e-12 * hi or d1 == 0.0:
+                hi, fhi = tn, d1
+                if side == 1:
+                    flo *= 0.5
+                side = 1
+            # stop on a point where Phi' <= 0 was computed and the root is pinned (bracket or derivative at rounding);
+            # a tiny positive Phi' does not stop it: the step must end on the descending side
+            if lo > 0.0 and (hi - lo <= 1e-12 * hi or abs(flo) <= 1e-12 * P):
                 break
         t = lo                                         # the largest t at which Phi' <= 0 was computed
     if t < RAY_MIN:

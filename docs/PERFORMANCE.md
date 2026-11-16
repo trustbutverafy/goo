@@ -715,3 +715,38 @@ machine's effective single core at times, so the wall times are upper bounds:
 
 The next speed-up of the quiet step lies in the maps (a compiled per-cell kernel the world can call, signature in
 the report) and in fewer map calls per step (the substeps re-evaluate at states another substep already evaluated).
+
+### 9a. The maps' share (item A, after the substance package moved to this owner for performance)
+
+**What changed:**
+- **The mixing free energy is a compiled per-cell kernel** (`goo/substance/_mixkernel.py`), the default behind
+  `_freeenergy.evaluate` and `hvp`. The numpy versions remain as `evaluate_reference` and `hvp_reference`, and are
+  tested against it (`tests/substance/test_mixkernel.py`). f and mu agree bit for bit in all but a few cells per
+  1e4 (the last bit of a log). The Hessian, f_x and mu_x agree to a few ulps of their largest entry. Measured on
+  786k cells with S = 3: potentials 0.15 s against 0.66 s for the reference.
+- **A new entry point, `maps.mixing_block(film, rows)`**: the Hessian only on the substances that exchange or sorb.
+  It is bit-identical to the full Hessian's block. The local Newton uses it, so no [S, S, N] array is formed.
+- **The mixing entry points read the film through a light view** (`_F.lite`): substances, q, T and presence.
+- **The ray's search is regula falsi** (Illinois) on Φ'. It needs no Hessian, and it ends on a point where Φ' ≤ 0
+  was computed.
+- **Φ'(0) is computed face by face** by summation by parts, and Φ'(t) − Φ'(0) from per-cell differences of
+  potentials. The cancellation of 1e9 J/m³ potentials over 786k cells had made the search return t = 0 and fall
+  back to Newton (13 to 17 s a step).
+- **A flux whose dissipation is below k_B T per cell is no flux.**
+- **The world no longer blocks its `mixing_hvp` calls**: the lead fixed the hvp defect, and blocked against whole
+  calls is bit-identical.
+
+**Measured on 1024 x 768, library maps, this machine (no other load seen):**
+
+| | before stage 1 | stage 1 | after item A |
+|---|---|---|---|
+| quiet step | 20.7 s, 2.98 GB | 13.7 to 14.4 s, 3.07 GB | 5.5 to 6.3 s, 1.3 to 1.7 GB |
+| a 30 um water, gum arabic and rutile paste dried until settle() retires it | | 151 steps, 1757 s | 151 steps, 720 s, 1.70 GB peak; all 786,432 cells retired |
+
+**Where a quiet step's 6 s go now** (profile, megapixel):
+- compiled mixing: 16 calls, 1.8 s;
+- the world's numpy arithmetic in diffuse, the ray, local and flow: about 2 s;
+- the other maps (viscosity, yield, mobility, exchange): about 1.3 s.
+
+The plan's 1.5 s needs the world's per-cell numpy fused into kernels as well, and fewer map evaluations per step.
+Not done.

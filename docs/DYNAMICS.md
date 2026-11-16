@@ -273,7 +273,11 @@ rounding: L is exactly 0 there); δ = −(dt/dx) div j. Along q(t) = qⁿ + t δ
 Φ(t) = F_c(q(t)) + t dx² ⟨μ_x(qⁿ) + ρψ, δ⟩ + ½ t² D1,       D1 = dt dx² Σ_f Σ_i ω_i (X_i − X̄)²  ≥ 0
 ```
 
-is convex (F_c convex, the rest linear and quadratic). Φ'(0) = −D1 (summation by parts). The step is the largest t in
+is convex (F_c convex, the rest linear and quadratic). Φ'(0) = −dt dx² Σ_f Σ_i j_i X_i (summation by parts, an
+identity; −D1 when no force is masked), and it is computed so, face by face: summed over the cells, ⟨μ, δ⟩ cancels
+potentials of 1e9 J/m³ and its rounding exceeded D1 on a megapixel paste (the search then returned t = 0). Φ'(t) − Φ'(0)
+is computed as the sum of the per-cell differences μ_c(q(t)) − μ_c(qⁿ) against δ, each known to its own rounding. The
+sign of Φ' is then decided on numbers of the size of the step's energy, not of F's. The step is the largest t in
 [0, T], T = min(1, what keeps every amount positive), at which Φ'(t) ≤ 0 was *computed*: T itself when Φ'(T) ≤ 0,
 else the lower end of a safeguarded Newton-bisection bracket on Φ' (each evaluation one mixing call). The flux applied
 is t j and the force that drives it through the same L is t (X − X̄), so D_mech = t² D1, a sum of non-negative terms.
@@ -509,8 +513,10 @@ is replaced by its midpoint: where Newton stays inside the iterates are unchange
 potential bends sharply at the glass transition) it two-cycled and the step halved 516 times in 300 s of drying.
 *Potentials without Hessians.* Where a substep needs μ and not the Hessian (the ray, the flow's transport term, the
 local step's bracketing and drain tests, F's mixing term) the world calls the protocol's optional
-`mixing_potentials` (the same values, no [S, S, n] array), and the ray's δᵀHδ comes from `mixing_hvp`; a constitutive
-object without them is served by `mixing`. The maps are not
+`mixing_potentials` (the same values, no [S, S, n] array), and the local Newton reads only the Hessian's block on the
+substances that exchange or sorb (`mixing_block`); a constitutive object without them is served by `mixing`. The ray's
+search on Φ' is regula falsi (Illinois), with no Hessian, and ends on a point where Φ' ≤ 0 was computed; a flux whose
+dissipation D1 is below k_B T per cell of the solve while Φ'(0) shows no descent to rounding is no flux (D_num = 0). The maps are not
 compiled by the world (SPEC §4.4): they are most of the local step's time (measured: 57 % of it on a 197k-cell paste).
 
 *settle()* retires every wet cell whose viscosity is +inf (no liquid left, or jammed particles): mobility is
